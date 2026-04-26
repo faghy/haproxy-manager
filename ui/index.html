@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HAProxy Manager</title>
+<style>
+  :root {
+    --bg: #111217; --bg2: #181b1f; --bg3: #1f2228;
+    --border: #2a2d35; --text: #d4d7e0; --text2: #8b8fa8;
+    --accent: #3871dc; --accent2: #5b8dee;
+    --green: #2ecc71; --red: #e74c3c; --orange: #f39c12;
+    --radius: 8px; --font: 'Segoe UI', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; }
+  #login-page { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .login-box { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 40px; width: 360px; }
+  .login-box h1 { font-size: 22px; margin-bottom: 8px; }
+  .login-box p { color: var(--text2); font-size: 14px; margin-bottom: 28px; }
+  #app { display: none; }
+  .topbar { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 0 24px; height: 56px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 100; }
+  .logo { font-size: 18px; font-weight: 700; color: var(--accent2); }
+  .status-badge { padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; background: rgba(46,204,113,0.15); color: var(--green); }
+  .status-badge.down { background: rgba(231,76,60,0.15); color: var(--red); }
+  .main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .stat-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .stat-card .label { color: var(--text2); font-size: 13px; margin-bottom: 8px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; }
+  .value.green { color: var(--green); } .value.orange { color: var(--orange); } .value.blue { color: var(--accent2); }
+  .panel { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 20px; }
+  .panel-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+  .panel-header h2 { font-size: 15px; font-weight: 600; }
+  .panel-body { padding: 20px; }
+  .form-row { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  input, select { background: var(--bg3); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 9px 14px; font-size: 14px; outline: none; transition: border-color 0.2s; }
+  input:focus, select:focus { border-color: var(--accent); }
+  input.grow { flex: 1; min-width: 200px; }
+  .btn { padding: 9px 18px; border-radius: 6px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; white-space: nowrap; }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-success { background: var(--green); color: #fff; }
+  .btn-danger  { background: var(--red); color: #fff; }
+  .btn-ghost   { background: var(--bg3); color: var(--text); border: 1px solid var(--border); }
+  .btn-sm { padding: 5px 12px; font-size: 12px; }
+  .search-bar { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .search-bar input { flex: 1; min-width: 200px; }
+  .bulk-bar { background: var(--bg3); border: 1px solid var(--accent); border-radius: 6px; padding: 12px 16px; display: none; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .bulk-bar.visible { display: flex; }
+  .bulk-bar span { color: var(--accent2); font-weight: 600; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; padding: 10px 14px; color: var(--text2); font-size: 12px; font-weight: 600; text-transform: uppercase; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .domain-name { font-family: monospace; font-size: 13px; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .badge-varnish { background: rgba(88,166,255,0.15); color: #58a6ff; }
+  .badge-server  { background: rgba(246,185,59,0.15); color: #f6b93b; }
+  .badge-default { background: rgba(139,143,168,0.15); color: var(--text2); }
+  .backend-select { padding: 4px 8px; font-size: 12px; }
+  .log-list { font-family: monospace; font-size: 12px; color: var(--text2); max-height: 300px; overflow-y: auto; line-height: 1.8; }
+  .log-add { color: var(--green); } .log-delete { color: var(--red); } .log-update { color: var(--orange); } .log-reload { color: var(--accent2); }
+  .pagination { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+  .page-info { color: var(--text2); font-size: 13px; }
+  #toast { position: fixed; bottom: 24px; right: 24px; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 20px; font-size: 14px; max-width: 320px; z-index: 9999; transform: translateY(100px); opacity: 0; transition: all 0.3s; pointer-events: none; }
+  #toast.show { transform: translateY(0); opacity: 1; }
+  #toast.success { border-color: var(--green); color: var(--green); }
+  #toast.error   { border-color: var(--red);   color: var(--red); }
+</style>
+</head>
+<body>
+
+<div id="login-page">
+  <div class="login-box">
+    <h1>🔧 HAProxy Manager</h1>
+    <p>Accedi per gestire i domini</p>
+    <div class="form-row" style="flex-direction:column">
+      <input type="text" id="login-user" placeholder="Username" value="admin">
+      <input type="password" id="login-pass" placeholder="Password">
+      <button class="btn btn-primary" onclick="doLogin()">Accedi</button>
+    </div>
+    <div id="login-error" style="color:var(--red);font-size:13px;margin-top:12px;display:none"></div>
+  </div>
+</div>
+
+<div id="app">
+  <div class="topbar">
+    <div style="display:flex;align-items:center;gap:16px">
+      <span class="logo">🔧 HAProxy Manager</span>
+      <span id="haproxy-status" class="status-badge">● Checking...</span>
+    </div>
+    <div style="display:flex;gap:12px;align-items:center">
+      <button class="btn btn-success btn-sm" onclick="reloadHaproxy()">⟳ Reload HAProxy</button>
+      <button class="btn btn-ghost btn-sm" onclick="doLogout()">Esci</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="stats-grid">
+      <div class="stat-card"><div class="label">Domini totali</div><div class="value blue" id="stat-total">-</div></div>
+      <div class="stat-card"><div class="label">Via Varnish</div><div class="value green" id="stat-varnish">-</div></div>
+      <div class="stat-card"><div class="label">Backend diretti</div><div class="value orange" id="stat-direct">-</div></div>
+      <div class="stat-card"><div class="label">Backend disponibili</div><div class="value blue" id="stat-backends">-</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header"><h2>➕ Aggiungi Dominio</h2></div>
+      <div class="panel-body">
+        <div class="form-row">
+          <input class="grow" type="text" id="new-domain" placeholder="esempio.it">
+          <select id="new-backend"></select>
+          <button class="btn btn-primary" onclick="addDomain()">Aggiungi</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <h2>🌐 Domini</h2>
+        <button class="btn btn-ghost btn-sm" onclick="loadDomains()">↻ Aggiorna</button>
+      </div>
+      <div class="panel-body">
+        <div class="search-bar">
+          <input type="text" id="search" placeholder="🔍 Cerca dominio..." oninput="filterDomains()">
+          <select id="filter-backend" onchange="filterDomains()">
+            <option value="">Tutti i backend</option>
+          </select>
+        </div>
+        <div class="bulk-bar" id="bulk-bar">
+          <span id="bulk-count">0 selezionati</span>
+          <select id="bulk-backend"></select>
+          <button class="btn btn-primary btn-sm" onclick="bulkUpdate()">Cambia Backend</button>
+          <button class="btn btn-ghost btn-sm" onclick="clearSelection()">Deseleziona</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th><input type="checkbox" id="select-all" onchange="toggleAll(this)"></th>
+                <th>Dominio</th>
+                <th>Backend</th>
+                <th>Azioni</th>
+              </tr>
+            </thead>
+            <tbody id="domains-table"></tbody>
+          </table>
+        </div>
+        <div class="pagination">
+          <button class="btn btn-ghost btn-sm" onclick="prevPage()">‹ Prec</button>
+          <span class="page-info" id="page-info"></span>
+          <button class="btn btn-ghost btn-sm" onclick="nextPage()">Succ ›</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <h2>📋 Log Modifiche</h2>
+        <button class="btn btn-ghost btn-sm" onclick="loadLogs()">↻ Aggiorna</button>
+      </div>
+      <div class="panel-body">
+        <div class="log-list" id="log-list">Caricamento...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+let token = localStorage.getItem('hm_token') || '';
+let allDomains = [], backends = [], filtered = [];
+let page = 1;
+const PAGE_SIZE = 50;
+let selected = new Set();
+
+async function api(path, method = 'GET', body = null, noAuth = false) {
+  const headers = {'Content-Type': 'application/json'};
+  if (!noAuth && token) headers['X-Session-Token'] = token;
+  const opts = {method, headers};
+  if (body) opts.body = JSON.stringify(body);
+  try {
+    const res = await fetch(path, opts);
+    if (res.status === 401) { doLogout(); return {success: false}; }
+    return await res.json();
+  } catch(e) { return {success: false, message: e.toString()}; }
+}
+
+async function doLogin() {
+  const u = document.getElementById('login-user').value;
+  const p = document.getElementById('login-pass').value;
+  const res = await api('/auth/login', 'POST', {username: u, password: p}, true);
+  if (res.success) {
+    token = res.data.token;
+    localStorage.setItem('hm_token', token);
+    showApp();
+  } else {
+    const el = document.getElementById('login-error');
+    el.textContent = res.message;
+    el.style.display = 'block';
+  }
+}
+
+async function doLogout() {
+  await api('/auth/logout', 'POST');
+  token = '';
+  localStorage.removeItem('hm_token');
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('login-page').style.display = 'flex';
+}
+
+function showApp() {
+  document.getElementById('login-page').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  init();
+}
+
+async function init() {
+  await loadBackends();
+  await loadDomains();
+  await loadLogs();
+  await checkStatus();
+  setInterval(checkStatus, 30000);
+  setInterval(loadLogs, 60000);
+}
+
+async function loadBackends() {
+  const res = await api('/api/backends');
+  if (!res.success) return;
+  backends = res.data;
+  document.getElementById('stat-backends').textContent = backends.length;
+  ['new-backend','bulk-backend'].forEach(id => {
+    const sel = document.getElementById(id);
+    sel.innerHTML = backends.map(b => `<option value="${b}">${b}</option>`).join('');
+  });
+  const fb = document.getElementById('filter-backend');
+  fb.innerHTML = '<option value="">Tutti i backend</option>' +
+    backends.map(b => `<option value="${b}">${b}</option>`).join('');
+}
+
+async function loadDomains() {
+  const res = await api('/api/domains');
+  if (!res.success) return;
+  allDomains = res.data;
+  filterDomains();
+  updateStats();
+}
+
+function updateStats() {
+  document.getElementById('stat-total').textContent = allDomains.length;
+  document.getElementById('stat-varnish').textContent = allDomains.filter(d => d.backend.includes('varnish')).length;
+  document.getElementById('stat-direct').textContent  = allDomains.filter(d => !d.backend.includes('varnish')).length;
+}
+
+function filterDomains() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const b = document.getElementById('filter-backend').value;
+  filtered = allDomains.filter(d =>
+    (!q || d.name.toLowerCase().includes(q) || d.backend.toLowerCase().includes(q)) &&
+    (!b || d.backend === b)
+  );
+  page = 1;
+  renderTable();
+}
+
+function renderTable() {
+  const start = (page - 1) * PAGE_SIZE;
+  const pageData = filtered.slice(start, start + PAGE_SIZE);
+  document.getElementById('domains-table').innerHTML = pageData.map(d => `
+    <tr>
+      <td><input type="checkbox" class="row-check" value="${d.name}"
+        ${selected.has(d.name) ? 'checked' : ''}
+        onchange="toggleSelect('${d.name}', this.checked)"></td>
+      <td class="domain-name">${d.name}</td>
+      <td><span class="badge ${badgeClass(d.backend)}">${d.backend}</span></td>
+      <td>
+        <div style="display:flex;gap:6px;align-items:center">
+          <select class="backend-select" id="sel-${d.name.replace(/[^a-z0-9]/gi,'_')}">
+            ${backends.map(b => `<option value="${b}" ${b===d.backend?'selected':''}>${b}</option>`).join('')}
+          </select>
+          <button class="btn btn-primary btn-sm" onclick="updateDomain('${d.name}')">✓</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteDomain('${d.name}')">✕</button>
+        </div>
+      </td>
+    </tr>`).join('');
+  const pages = Math.ceil(filtered.length / PAGE_SIZE);
+  document.getElementById('page-info').textContent = `Pagina ${page}/${pages||1} — ${filtered.length} domini`;
+}
+
+function badgeClass(b) {
+  if (b.includes('varnish')) return 'badge-varnish';
+  if (b.includes('server'))  return 'badge-server';
+  return 'badge-default';
+}
+
+async function addDomain() {
+  const name    = document.getElementById('new-domain').value.trim();
+  const backend = document.getElementById('new-backend').value;
+  if (!name) return toast('Inserisci un dominio', 'error');
+  const res = await api('/api/domains', 'POST', {name, backend});
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) { document.getElementById('new-domain').value = ''; loadDomains(); }
+}
+
+async function updateDomain(name) {
+  const selId = 'sel-' + name.replace(/[^a-z0-9]/gi, '_');
+  const backend = document.getElementById(selId).value;
+  const res = await api(`/api/domains/${encodeURIComponent(name)}`, 'PUT', {name, backend});
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) loadDomains();
+}
+
+async function deleteDomain(name) {
+  if (!confirm(`Rimuovere ${name}?`)) return;
+  const res = await api(`/api/domains/${encodeURIComponent(name)}`, 'DELETE');
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) loadDomains();
+}
+
+function toggleSelect(name, checked) {
+  if (checked) selected.add(name); else selected.delete(name);
+  updateBulkBar();
+}
+
+function toggleAll(cb) {
+  filtered.slice((page-1)*PAGE_SIZE, page*PAGE_SIZE).forEach(d => {
+    if (cb.checked) selected.add(d.name); else selected.delete(d.name);
+  });
+  renderTable(); updateBulkBar();
+}
+
+function updateBulkBar() {
+  document.getElementById('bulk-count').textContent = `${selected.size} selezionati`;
+  document.getElementById('bulk-bar').classList.toggle('visible', selected.size > 0);
+}
+
+function clearSelection() { selected.clear(); renderTable(); updateBulkBar(); }
+
+async function bulkUpdate() {
+  const backend = document.getElementById('bulk-backend').value;
+  if (!backend) return toast('Seleziona un backend', 'error');
+  const res = await api('/api/domains/bulk', 'POST', {domains: Array.from(selected), backend});
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) { clearSelection(); loadDomains(); }
+}
+
+function prevPage() { if (page > 1) { page--; renderTable(); } }
+function nextPage() { if (page < Math.ceil(filtered.length/PAGE_SIZE)) { page++; renderTable(); } }
+
+async function reloadHaproxy() {
+  const res = await api('/api/haproxy/reload', 'POST');
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) loadLogs();
+}
+
+async function checkStatus() {
+  const res = await api('/api/haproxy/status');
+  const badge = document.getElementById('haproxy-status');
+  badge.textContent = res.success ? '● HAProxy active' : '● HAProxy down';
+  badge.className   = 'status-badge' + (res.success ? '' : ' down');
+}
+
+async function loadLogs() {
+  const res = await api('/api/logs');
+  const el = document.getElementById('log-list');
+  if (!res.success || !res.data.length) {
+    el.innerHTML = '<span style="color:var(--text2)">Nessun log disponibile</span>';
+    return;
+  }
+  el.innerHTML = res.data.map(line => {
+    let cls = '';
+    if (line.includes('ADD'))    cls = 'log-add';
+    if (line.includes('DELETE')) cls = 'log-delete';
+    if (line.includes('UPDATE') || line.includes('BULK')) cls = 'log-update';
+    if (line.includes('RELOAD')) cls = 'log-reload';
+    return `<div class="${cls}">${line}</div>`;
+  }).join('');
+}
+
+let toastTimer;
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = (type === 'success' ? '✓ ' : '✕ ') + msg;
+  el.className = `show ${type}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = '', 3500);
+}
+
+document.getElementById('login-pass').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+
+if (token) {
+  api('/api/domains').then(res => {
+    if (res.success) showApp();
+    else { token = ''; localStorage.removeItem('hm_token'); }
+  });
+}
+</script>
+</body>
+</html>
