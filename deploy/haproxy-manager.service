@@ -1,0 +1,30 @@
+# /etc/systemd/system/haproxy-manager.service
+# Gira come utente haproxy-manager: scrive solo /etc/haproxy/maps, il suo log
+# e lo storico; check/reload HAProxy, ban Varnish e certificati via sudo
+# con /usr/local/sbin/haproxy-manager-helper
+[Unit]
+Description=HAProxy Manager
+After=network.target haproxy.service keepalived.service
+
+[Service]
+Type=simple
+User=haproxy-manager
+Group=haproxy-manager
+WorkingDirectory=/opt/haproxy-manager
+ExecStart=/opt/haproxy-manager/target/release/haproxy-manager
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+UMask=0022
+StateDirectory=haproxy-manager
+ProtectSystem=full
+ReadWritePaths=/etc/haproxy/maps
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

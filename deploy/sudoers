@@ -1,0 +1,2 @@
+# /etc/sudoers.d/haproxy-manager (root:root 0440)
+haproxy-manager ALL=(root) NOPASSWD: /usr/local/sbin/haproxy-manager-helper

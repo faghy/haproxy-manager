@@ -67,10 +67,18 @@
   .log-add { color: var(--green); } .log-delete { color: var(--red); } .log-update { color: var(--orange); } .log-reload { color: var(--accent2); }
   .pagination { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
   .page-info { color: var(--text2); font-size: 13px; }
-  #toast { position: fixed; bottom: 24px; right: 24px; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 20px; font-size: 14px; max-width: 320px; z-index: 9999; transform: translateY(100px); opacity: 0; transition: all 0.3s; pointer-events: none; }
+  #toast { position: fixed; bottom: 24px; right: 24px; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 20px; font-size: 14px; max-width: 440px; z-index: 9999; transform: translateY(100px); opacity: 0; transition: all 0.3s; pointer-events: none; }
   #toast.show { transform: translateY(0); opacity: 1; }
   #toast.success { border-color: var(--green); color: var(--green); }
   #toast.error   { border-color: var(--red);   color: var(--red); }
+  .cert-missing { color: var(--orange); font-size: 12px; margin-left: 6px; cursor: help; }
+  .hist-row { display: flex; gap: 12px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .hist-row:last-child { border-bottom: none; }
+  .hist-time { color: var(--text2); font-family: monospace; font-size: 12px; white-space: nowrap; }
+  .hist-src { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: var(--bg3); color: var(--text2); }
+  .hist-main { flex: 1; }
+  .hist-changes { color: var(--text2); font-family: monospace; font-size: 12px; }
+  .hist-undone { opacity: 0.5; }
 </style>
 </head>
 <body>
@@ -162,6 +170,16 @@
 
     <div class="panel">
       <div class="panel-header">
+        <h2>🕘 Storico modifiche</h2>
+        <button class="btn btn-ghost btn-sm" onclick="loadHistory()">↻ Aggiorna</button>
+      </div>
+      <div class="panel-body">
+        <div id="history-list" style="max-height:420px;overflow-y:auto">Caricamento...</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
         <h2>📋 Log Modifiche</h2>
         <button class="btn btn-ghost btn-sm" onclick="loadLogs()">↻ Aggiorna</button>
       </div>
@@ -235,6 +253,7 @@ let timersStarted = false;
 async function init() {
   await loadBackends();
   await loadDomains();
+  await loadHistory();
   await loadLogs();
   await checkStatus();
   // una sola volta, anche dopo logout e nuovo login; da sloggati non chiamano le API
@@ -295,7 +314,7 @@ function renderTable() {
       <td><input type="checkbox" class="row-check" value="${d.name}"
         ${selected.has(d.name) ? 'checked' : ''}
         onchange="toggleSelect('${d.name}', this.checked)"></td>
-      <td class="domain-name">${d.name}</td>
+      <td class="domain-name">${d.name}${d.cert === false ? '<span class="cert-missing" title="Nessun certificato in /etc/haproxy/certs copre questo dominio: Cloudflare risponderà 526">⚠ certificato</span>' : ''}</td>
       <td><span class="badge ${badgeClass(d.backend)}">${d.backend}</span></td>
       <td>${d.origin ? `<span class="badge ${badgeClass(d.origin)}">${d.origin}</span>` : '<span style="color:var(--red)">mancante</span>'}</td>
       <td>
@@ -342,7 +361,7 @@ async function addDomain() {
   if (!name) return toast('Inserisci un dominio', 'error');
   const res = await api('/api/domains', 'POST', {name, backend, origin});
   toast(res.message, res.success ? 'success' : 'error');
-  if (res.success) { document.getElementById('new-domain').value = ''; loadDomains(); }
+  if (res.success) { document.getElementById('new-domain').value = ''; refresh(); }
 }
 
 async function updateDomain(name) {
@@ -350,14 +369,14 @@ async function updateDomain(name) {
   const origin  = backend === VARNISH ? document.getElementById('org-' + rowId(name)).value : null;
   const res = await api(`/api/domains/${encodeURIComponent(name)}`, 'PUT', {name, backend, origin});
   toast(res.message, res.success ? 'success' : 'error');
-  if (res.success) loadDomains();
+  if (res.success) refresh();
 }
 
 async function deleteDomain(name) {
   if (!confirm(`Rimuovere ${name}?`)) return;
   const res = await api(`/api/domains/${encodeURIComponent(name)}`, 'DELETE');
   toast(res.message, res.success ? 'success' : 'error');
-  if (res.success) loadDomains();
+  if (res.success) refresh();
 }
 
 async function purgeCache(domain) {
@@ -390,7 +409,7 @@ async function bulkUpdate() {
   if (!backend) return toast('Seleziona un backend', 'error');
   const res = await api('/api/domains/bulk', 'POST', {domains: Array.from(selected), backend});
   toast(res.message, res.success ? 'success' : 'error');
-  if (res.success) { clearSelection(); loadDomains(); }
+  if (res.success) { clearSelection(); refresh(); }
 }
 
 function prevPage() { if (page > 1) { page--; renderTable(); } }
@@ -426,13 +445,56 @@ async function loadLogs() {
   }).join('');
 }
 
+// Dopo una modifica: tabella, storico e log
+function refresh() { loadDomains(); loadHistory(); loadLogs(); }
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtEntry(e) {
+  if (!e) return '—';
+  return e.backend === VARNISH ? `varnish → ${e.origin}` : e.backend;
+}
+
+let history = [];
+async function loadHistory() {
+  const res = await api('/api/history');
+  history = res.success ? res.data : [];
+  const el = document.getElementById('history-list');
+  if (!res.success || !res.data.length) {
+    el.innerHTML = '<span style="color:var(--text2)">Nessuna modifica registrata</span>';
+    return;
+  }
+  el.innerHTML = res.data.map(h => `
+    <div class="hist-row ${h.undone ? 'hist-undone' : ''}">
+      <span class="hist-time">${esc(h.time)}</span>
+      <span class="hist-src">${h.source === 'plesk' ? 'Plesk' : 'manager'}</span>
+      <div class="hist-main">
+        <div>${esc(h.action)}${h.undone ? ' <em>(annullata)</em>' : ''}</div>
+        <div class="hist-changes">${h.changes.slice(0, 5).map(c =>
+          `${esc(c.domain)}: ${esc(fmtEntry(c.before))} → ${esc(fmtEntry(c.after))}`).join('<br>')}${
+          h.changes.length > 5 ? `<br>… e altri ${h.changes.length - 5}` : ''}</div>
+      </div>
+      ${h.undone ? '' : `<button class="btn btn-ghost btn-sm" onclick="undoChange('${esc(h.id)}')">↶ Annulla</button>`}
+    </div>`).join('');
+}
+
+async function undoChange(id) {
+  const h = history.find(x => x.id === id);
+  if (!confirm(`Annullare "${h ? h.action : id}"?`)) return;
+  const res = await api(`/api/history/${encodeURIComponent(id)}/undo`, 'POST');
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) refresh();
+}
+
 let toastTimer;
 function toast(msg, type = 'success') {
   const el = document.getElementById('toast');
   el.textContent = (type === 'success' ? '✓ ' : '✕ ') + msg;
   el.className = `show ${type}`;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.className = '', 3500);
+  toastTimer = setTimeout(() => el.className = '', msg.length > 60 ? 8000 : 3500);
 }
 
 document.getElementById('login-pass').addEventListener('keydown', e => {

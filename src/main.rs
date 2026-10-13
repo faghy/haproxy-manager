@@ -10,10 +10,13 @@ use axum::{
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
+    io::Write,
+    os::unix::fs::MetadataExt,
     process::Command,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -22,7 +25,7 @@ use uuid::Uuid;
 fn load_config() -> Config {
     // Prova a caricare .env dalla directory corrente o da /opt/haproxy-manager/
     let env_paths = [".env", "/opt/haproxy-manager/.env"];
-    
+
     for path in env_paths {
         if std::path::Path::new(path).exists() {
             std::env::set_current_dir(std::path::Path::new(path).parent().unwrap()).ok();
@@ -30,17 +33,19 @@ fn load_config() -> Config {
             break;
         }
     }
-    
+
     Config {
         domains_map: std::env::var("DOMAINS_MAP").unwrap_or_else(|_| "/etc/haproxy/maps/domains.map".to_string()),
         backends_map: std::env::var("BACKENDS_MAP").unwrap_or_else(|_| "/etc/haproxy/maps/backends.map".to_string()),
         haproxy_cfg: std::env::var("HAPROXY_CFG").unwrap_or_else(|_| "/etc/haproxy/haproxy.cfg".to_string()),
         log_file: std::env::var("LOG_FILE").unwrap_or_else(|_| "/var/log/haproxy-manager.log".to_string()),
+        history_file: std::env::var("HISTORY_FILE").unwrap_or_else(|_| "/var/lib/haproxy-manager/history.jsonl".to_string()),
         listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
         admin_user: std::env::var("ADMIN_USER").unwrap_or_else(|_| "admin".to_string()),
-        admin_pass: std::env::var("ADMIN_PASS").unwrap_or_else(|_| "CHANGE_ME".to_string()),
+        admin_pass_hash: std::env::var("ADMIN_PASS_HASH").ok().filter(|s| !s.is_empty()),
+        admin_pass: std::env::var("ADMIN_PASS").ok().filter(|s| !s.is_empty() && s != "CHANGE_ME"),
         ui_dir: std::env::var("UI_DIR").unwrap_or_else(|_| "/opt/haproxy-manager/ui".to_string()),
-        varnish_adm: std::env::var("VARNISH_ADM").unwrap_or_else(|_| "/usr/bin/varnishadm".to_string()),
+        helper: std::env::var("HELPER").unwrap_or_else(|_| "/usr/local/sbin/haproxy-manager-helper".to_string()),
     }
 }
 
@@ -50,11 +55,15 @@ struct Config {
     backends_map: String,
     haproxy_cfg: String,
     log_file: String,
+    history_file: String,
     listen_addr: String,
     admin_user: String,
-    admin_pass: String,
+    // Hash bcrypt (haproxy-manager hash-password); ADMIN_PASS in chiaro solo come ripiego
+    admin_pass_hash: Option<String>,
+    admin_pass: Option<String>,
     ui_dir: String,
-    varnish_adm: String,
+    // Unico comando eseguito come root (via sudo): check/reload HAProxy, ban Varnish, certificati
+    helper: String,
 }
 
 // ── Strutture ─────────────────────────────────────────────────────
@@ -62,6 +71,16 @@ struct Config {
 const VARNISH_BACKEND: &str = "varnish_backend";
 // Stesso lock di /usr/local/sbin/haproxy-domain (script degli eventi Plesk)
 const MAPS_LOCK: &str = "/run/lock/haproxy-maps.lock";
+// Sessione: scade dopo 2 ore di inattività e comunque dopo 12 ore
+const SESSION_IDLE: Duration = Duration::from_secs(2 * 3600);
+const SESSION_MAX: Duration = Duration::from_secs(12 * 3600);
+// Login: dopo 5 errori in 15 minuti, bloccato per 15 minuti
+const LOGIN_MAX_FAILS: u32 = 5;
+const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
+const LOGIN_BLOCK: Duration = Duration::from_secs(15 * 60);
+// Elenco dei nomi nei certificati: riletto al massimo ogni minuto
+const CERT_CACHE_TTL: Duration = Duration::from_secs(60);
+const HISTORY_KEEP: usize = 1000;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Domain {
@@ -70,6 +89,15 @@ struct Domain {
     // Server di origine (backends.map): uguale a backend se diretto
     #[serde(default)]
     origin:  Option<String>,
+}
+
+// Dominio come lo vede la UI: con l'indicazione del certificato
+#[derive(Serialize)]
+struct DomainView {
+    #[serde(flatten)]
+    domain: Domain,
+    // false: nessun certificato in /etc/haproxy/certs copre il dominio (Cloudflare 526)
+    cert:   Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -98,10 +126,57 @@ struct ApiResponse<T: Serialize> {
     data:    Option<T>,
 }
 
+// ── Storico (history.jsonl, scritto anche da haproxy-domain) ─────
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct MapEntry {
+    backend: String,
+    origin:  Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Change {
+    domain: String,
+    before: Option<MapEntry>,
+    after:  Option<MapEntry>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct HistoryEntry {
+    id:      String,
+    time:    String,
+    // "manager" o "plesk" (eventi dei Plesk via haproxy-domain)
+    source:  String,
+    action:  String,
+    changes: Vec<Change>,
+    #[serde(default)]
+    undo_of: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HistoryView {
+    #[serde(flatten)]
+    entry:  HistoryEntry,
+    undone: bool,
+}
+
+struct Session {
+    created:   Instant,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct LoginGuard {
+    fails:         u32,
+    first_fail:    Option<Instant>,
+    blocked_until: Option<Instant>,
+}
+
 #[derive(Clone)]
 struct AppState {
-    sessions: Arc<RwLock<HashMap<String, String>>>,
-    config: Config,
+    sessions:    Arc<RwLock<HashMap<String, Session>>>,
+    login_guard: Arc<Mutex<LoginGuard>>,
+    cert_cache:  Arc<Mutex<Option<(Instant, Vec<String>)>>>,
+    config:      Config,
 }
 
 // ── File I/O ──────────────────────────────────────────────────────
@@ -158,14 +233,17 @@ fn write_domains(config: &Config, domains: &[Domain]) -> Result<(), String> {
     write_map(&config.domains_map, &front)
 }
 
-// Lock condiviso con lo script degli eventi Plesk per la lettura-modifica-scrittura
+// Lock condiviso con lo script degli eventi Plesk per la lettura-modifica-scrittura.
+// Se il file l'ha creato root senza permesso di scrittura basta aprirlo in lettura:
+// flock non guarda la modalità di apertura
 fn lock_maps() -> Result<fs::File, String> {
     let f = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(MAPS_LOCK)
-        .map_err(|e| e.to_string())?;
+        .or_else(|_| fs::File::open(MAPS_LOCK))
+        .map_err(|e| format!("{}: {}", MAPS_LOCK, e))?;
     f.lock().map_err(|e| e.to_string())?;
     Ok(f)
 }
@@ -223,23 +301,27 @@ fn resolve_origin(
     Ok(origin)
 }
 
-fn reload_haproxy(config: &Config) -> Result<String, String> {
-    let check = Command::new("haproxy")
-        .args(["-c", "-f", &config.haproxy_cfg])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !check.status.success() {
-        return Err(String::from_utf8_lossy(&check.stderr).to_string());
-    }
-    let reload = Command::new("systemctl")
-        .args(["reload", "haproxy"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if reload.status.success() {
-        Ok("HAProxy ricaricato con successo".to_string())
+// ── Comandi privilegiati (haproxy-manager-helper, via sudo se non root) ─
+fn run_helper(config: &Config, args: &[&str]) -> Result<String, String> {
+    let is_root = fs::metadata("/proc/self").map(|m| m.uid() == 0).unwrap_or(false);
+    let mut cmd = if is_root {
+        Command::new(&config.helper)
     } else {
-        Err(String::from_utf8_lossy(&reload.stderr).to_string())
+        let mut c = Command::new("sudo");
+        c.args(["-n", &config.helper]);
+        c
+    };
+    let output = cmd.args(args).output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if err.is_empty() { format!("{} {} fallito", config.helper, args.join(" ")) } else { err })
     }
+}
+
+fn reload_haproxy(config: &Config) -> Result<String, String> {
+    run_helper(config, &["reload"]).map(|_| "HAProxy ricaricato con successo".to_string())
 }
 
 fn log_action(config: &Config, action: &str, domain: &str, detail: &str) {
@@ -258,19 +340,126 @@ fn log_action(config: &Config, action: &str, domain: &str, detail: &str) {
 }
 
 fn purge_varnish_cache(config: &Config, domain: &str) -> Result<String, String> {
-    // Anche www.: Varnish tiene in cache l'Host così come arriva
+    // L'helper vieta tutto tranne un dominio valido e costruisce lui il ban
+    // (anche www.: Varnish tiene in cache l'Host così come arriva)
     let domain = normalize_domain(domain)?;
-    let expr = format!("req.http.host ~ ^(www[.])?{}$", domain.replace('.', "[.]"));
-    let output = Command::new(&config.varnish_adm)
-        .args(["ban", &expr])
-        .output()
-        .map_err(|e| e.to_string())?;
-    
-    if output.status.success() {
-        Ok(format!("Cache Varnish purgata per {}", domain))
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    run_helper(config, &["purge", &domain]).map(|_| format!("Cache Varnish purgata per {}", domain))
+}
+
+// ── Certificati ───────────────────────────────────────────────────
+// Nomi (SAN) di tutti i certificati in /etc/haproxy/certs, letti dall'helper
+fn cert_names(state: &AppState) -> Option<Vec<String>> {
+    let mut cache = state.cert_cache.lock().unwrap();
+    if let Some((at, names)) = cache.as_ref() {
+        if at.elapsed() < CERT_CACHE_TTL {
+            return Some(names.clone());
+        }
     }
+    let out = run_helper(&state.config, &["certs"]).ok()?;
+    let names: Vec<String> = out
+        .lines()
+        .flat_map(|l| l.split_whitespace().skip(1))
+        .map(|s| s.to_lowercase())
+        .collect();
+    *cache = Some((Instant::now(), names.clone()));
+    Some(names)
+}
+
+// Coperto da un nome uguale o da *.genitore (un solo livello, come nei certificati)
+fn cert_covers(names: &[String], domain: &str) -> bool {
+    let parent = domain.split_once('.').map(|(_, p)| p).unwrap_or("");
+    names.iter().any(|n| n == domain || n.strip_prefix("*.") == Some(parent))
+}
+
+fn cert_warning(state: &AppState, domain: &str) -> String {
+    match cert_names(state) {
+        Some(names) if !cert_covers(&names, domain) => format!(
+            " — attenzione: nessun certificato copre {}, Cloudflare risponderà 526",
+            domain
+        ),
+        _ => String::new(),
+    }
+}
+
+// ── Storico ───────────────────────────────────────────────────────
+fn read_history(config: &Config) -> Vec<HistoryEntry> {
+    fs::read_to_string(&config.history_file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+fn append_history(config: &Config, entry: &HistoryEntry) {
+    let Ok(line) = serde_json::to_string(entry) else { return };
+    let mut entries: Vec<String> = fs::read_to_string(&config.history_file)
+        .unwrap_or_default()
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    entries.push(line);
+    if entries.len() > HISTORY_KEEP {
+        entries = entries[entries.len() - HISTORY_KEEP..].to_vec();
+    }
+    let tmp = format!("{}.tmp", config.history_file);
+    let ok = fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all((entries.join("\n") + "\n").as_bytes()))
+        .and_then(|_| fs::rename(&tmp, &config.history_file));
+    if let Err(e) = ok {
+        tracing::warn!("storico non scritto ({}): {}", config.history_file, e);
+    }
+}
+
+fn entry_of(d: &Domain) -> MapEntry {
+    MapEntry { backend: d.backend.clone(), origin: d.origin.clone() }
+}
+
+fn diff_domains(old: &[Domain], new: &[Domain]) -> Vec<Change> {
+    let o: HashMap<&str, &Domain> = old.iter().map(|d| (d.name.as_str(), d)).collect();
+    let n: HashMap<&str, &Domain> = new.iter().map(|d| (d.name.as_str(), d)).collect();
+    let names: BTreeSet<&str> = o.keys().chain(n.keys()).copied().collect();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let before = o.get(name).map(|d| entry_of(d));
+            let after = n.get(name).map(|d| entry_of(d));
+            (before != after).then(|| Change { domain: name.to_string(), before, after })
+        })
+        .collect()
+}
+
+// Scrive le mappe, controlla e ricarica HAProxy; se HAProxy rifiuta la
+// configurazione rimette le mappe di prima. Va chiamata con il lock preso.
+fn commit_change(
+    config: &Config,
+    old: &[Domain],
+    new: &[Domain],
+    action: &str,
+    undo_of: Option<String>,
+) -> Result<usize, String> {
+    let changes = diff_domains(old, new);
+    if changes.is_empty() {
+        return Ok(0);
+    }
+    if let Err(e) = write_domains(config, new) {
+        let _ = write_domains(config, old);
+        return Err(e);
+    }
+    if let Err(e) = reload_haproxy(config) {
+        let _ = write_domains(config, old);
+        let _ = reload_haproxy(config);
+        return Err(format!("HAProxy ha rifiutato la modifica, mappe ripristinate: {}", e));
+    }
+    let n = changes.len();
+    append_history(config, &HistoryEntry {
+        id: format!("{}-{}", Local::now().format("%Y%m%d%H%M%S"), &Uuid::new_v4().simple().to_string()[..6]),
+        time: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        source: "manager".to_string(),
+        action: action.to_string(),
+        changes,
+        undo_of,
+    });
+    Ok(n)
 }
 
 // ── Middleware Auth ───────────────────────────────────────────────
@@ -281,14 +470,8 @@ async fn auth_middleware(
 ) -> Response {
     let path = request.uri().path().to_string();
 
-    // Route pubbliche
-    if path == "/auth/login"
-        || path == "/"
-        || path.starts_with("/static")
-        || path.ends_with(".html")
-        || path.ends_with(".css")
-        || path.ends_with(".js")
-    {
+    // Route pubbliche: solo la pagina, i suoi file e il login
+    if path == "/auth/login" || path == "/" || path.starts_with("/static/") {
         return next.run(request).await;
     }
 
@@ -299,10 +482,15 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    if let Some(t) = token {
-        if state.sessions.read().unwrap().contains_key(&t) {
-            return next.run(request).await;
-        }
+    // Il lock va rilasciato prima di qualsiasi .await
+    let valid = token.is_some_and(|t| {
+        let mut sessions = state.sessions.write().unwrap();
+        let now = Instant::now();
+        sessions.retain(|_, s| now - s.last_seen < SESSION_IDLE && now - s.created < SESSION_MAX);
+        sessions.get_mut(&t).map(|s| s.last_seen = now).is_some()
+    });
+    if valid {
+        return next.run(request).await;
     }
 
     (
@@ -328,29 +516,81 @@ struct LoginResponse {
     token: String,
 }
 
+// Confronto a tempo costante (non dipende da quanti caratteri coincidono)
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn check_credentials(config: &Config, user: &str, pass: &str) -> bool {
+    let user_ok = ct_eq(user.as_bytes(), config.admin_user.as_bytes());
+    let pass_ok = if let Some(hash) = &config.admin_pass_hash {
+        bcrypt::verify(pass, hash).unwrap_or(false)
+    } else if let Some(plain) = &config.admin_pass {
+        ct_eq(pass.as_bytes(), plain.as_bytes())
+    } else {
+        false
+    };
+    user_ok && pass_ok
+}
+
 async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
-) -> impl IntoResponse {
-    if req.username == state.config.admin_user && req.password == state.config.admin_pass {
+) -> Response {
+    if let Some(until) = state.login_guard.lock().unwrap().blocked_until {
+        let now = Instant::now();
+        if until > now {
+            let min = (until - now).as_secs() / 60 + 1;
+            return reply(
+                StatusCode::TOO_MANY_REQUESTS,
+                false,
+                format!("Troppi tentativi sbagliati: riprova tra {} minuti", min),
+            );
+        }
+    }
+
+    // bcrypt è lento apposta: fuori dal thread che serve le richieste
+    let config = state.config.clone();
+    let (user, pass) = (req.username, req.password);
+    let ok = tokio::task::spawn_blocking(move || check_credentials(&config, &user, &pass))
+        .await
+        .unwrap_or(false);
+
+    if ok {
+        *state.login_guard.lock().unwrap() = LoginGuard::default();
         let token = Uuid::new_v4().to_string();
+        let now = Instant::now();
         state
             .sessions
             .write()
             .unwrap()
-            .insert(token.clone(), req.username);
-        Json(ApiResponse {
+            .insert(token.clone(), Session { created: now, last_seen: now });
+        return Json(ApiResponse {
             success: true,
             message: "Login effettuato".to_string(),
             data: Some(LoginResponse { token }),
         })
-    } else {
-        Json(ApiResponse::<LoginResponse> {
-            success: false,
-            message: "Credenziali non valide".to_string(),
-            data: None,
-        })
+        .into_response();
     }
+
+    {
+        let mut g = state.login_guard.lock().unwrap();
+        let now = Instant::now();
+        if g.first_fail.map_or(true, |t| now - t > LOGIN_WINDOW) {
+            g.fails = 0;
+            g.first_fail = Some(now);
+        }
+        g.fails += 1;
+        if g.fails >= LOGIN_MAX_FAILS {
+            g.blocked_until = Some(now + LOGIN_BLOCK);
+            g.fails = 0;
+            g.first_fail = None;
+            tracing::warn!("login bloccato per {} minuti dopo {} errori", LOGIN_BLOCK.as_secs() / 60, LOGIN_MAX_FAILS);
+        }
+    }
+    log_action(&state.config, "LOGIN", "-", "credenziali non valide");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    reply(StatusCode::OK, false, "Credenziali non valide".to_string())
 }
 
 async fn logout(
@@ -371,7 +611,14 @@ async fn logout(
 async fn get_domains(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let domains = read_domains(&state.config);
+    let names = cert_names(&state);
+    let domains: Vec<DomainView> = read_domains(&state.config)
+        .into_iter()
+        .map(|d| {
+            let cert = names.as_ref().map(|n| cert_covers(n, &d.name));
+            DomainView { domain: d, cert }
+        })
+        .collect();
     Json(ApiResponse {
         success: true,
         message: format!("{} domini trovati", domains.len()),
@@ -395,23 +642,25 @@ async fn add_domain(
         Ok(l) => l,
         Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     };
-    let mut domains = read_domains(&state.config);
-    if domains.iter().any(|d| d.name == name) {
+    let old = read_domains(&state.config);
+    if old.iter().any(|d| d.name == name) {
         return reply(StatusCode::CONFLICT, false, format!("Dominio {} già esistente", name));
     }
     let origin = match resolve_origin(&state.config, &req.backend, req.origin.as_deref(), None) {
         Ok(o) => o,
         Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
     };
-    domains.push(Domain {
+    let mut new = old.clone();
+    new.push(Domain {
         name:    name.clone(),
         backend: req.backend.clone(),
         origin:  Some(origin.clone()),
     });
-    match write_domains(&state.config, &domains) {
+    match commit_change(&state.config, &old, &new, &format!("Aggiunto {}", name), None) {
         Ok(_) => {
             log_action(&state.config, "ADD", &name, &format!("{} (origine {})", req.backend, origin));
-            reply(StatusCode::OK, true, format!("Dominio {} aggiunto", name))
+            let warn = cert_warning(&state, &name);
+            reply(StatusCode::OK, true, format!("Dominio {} aggiunto{}", name, warn))
         }
         Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     }
@@ -426,22 +675,24 @@ async fn update_domain(
         Ok(l) => l,
         Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     };
-    let mut domains = read_domains(&state.config);
-    let Some(d) = domains.iter_mut().find(|d| d.name == domain) else {
+    let old = read_domains(&state.config);
+    let mut new = old.clone();
+    let Some(d) = new.iter_mut().find(|d| d.name == domain) else {
         return reply(StatusCode::NOT_FOUND, false, format!("Dominio {} non trovato", domain));
     };
     let origin = match resolve_origin(&state.config, &req.backend, req.origin.as_deref(), Some(d)) {
         Ok(o) => o,
         Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
     };
-    let old = format!("{} (origine {})", d.backend, d.origin.as_deref().unwrap_or("-"));
-    let new = format!("{} (origine {})", req.backend, origin);
+    let before = format!("{} (origine {})", d.backend, d.origin.as_deref().unwrap_or("-"));
+    let after = format!("{} (origine {})", req.backend, origin);
     d.backend = req.backend.clone();
     d.origin = Some(origin);
-    match write_domains(&state.config, &domains) {
+    match commit_change(&state.config, &old, &new, &format!("Modificato {}", domain), None) {
+        Ok(0) => reply(StatusCode::OK, true, format!("{}: nessuna modifica", domain)),
         Ok(_) => {
-            log_action(&state.config, "UPDATE", &domain, &format!("{} → {}", old, new));
-            reply(StatusCode::OK, true, format!("Backend: {} → {}", old, new))
+            log_action(&state.config, "UPDATE", &domain, &format!("{} → {}", before, after));
+            reply(StatusCode::OK, true, format!("Backend: {} → {}", before, after))
         }
         Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     }
@@ -455,13 +706,12 @@ async fn delete_domain(
         Ok(l) => l,
         Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     };
-    let mut domains = read_domains(&state.config);
-    let before = domains.len();
-    domains.retain(|d| d.name != domain);
-    if domains.len() == before {
+    let old = read_domains(&state.config);
+    let new: Vec<Domain> = old.iter().filter(|d| d.name != domain).cloned().collect();
+    if new.len() == old.len() {
         return reply(StatusCode::NOT_FOUND, false, format!("Dominio {} non trovato", domain));
     }
-    match write_domains(&state.config, &domains) {
+    match commit_change(&state.config, &old, &new, &format!("Rimosso {}", domain), None) {
         Ok(_) => {
             log_action(&state.config, "DELETE", &domain, "-");
             reply(StatusCode::OK, true, format!("Dominio {} rimosso", domain))
@@ -478,30 +728,104 @@ async fn bulk_update(
         Ok(l) => l,
         Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     };
-    let mut domains = read_domains(&state.config);
-    let mut updated = 0;
+    let old = read_domains(&state.config);
+    let mut new = old.clone();
     let mut skipped = Vec::new();
     for name in &req.domains {
-        if let Some(d) = domains.iter_mut().find(|d| &d.name == name) {
+        if let Some(d) = new.iter_mut().find(|d| &d.name == name) {
             // Verso Varnish ogni dominio tiene la sua origine
             match resolve_origin(&state.config, &req.backend, None, Some(d)) {
                 Ok(o) => {
                     d.backend = req.backend.clone();
                     d.origin = Some(o);
-                    updated += 1;
                 }
                 Err(_) => skipped.push(name.clone()),
             }
         }
     }
-    match write_domains(&state.config, &domains) {
-        Ok(_) => {
+    let action = format!("{} domini → {}", req.domains.len() - skipped.len(), req.backend);
+    match commit_change(&state.config, &old, &new, &action, None) {
+        Ok(updated) => {
             log_action(&state.config, "BULK", &format!("{} domini", updated), &req.backend);
             let mut msg = format!("{} domini → {}", updated, req.backend);
             if !skipped.is_empty() {
                 msg.push_str(&format!(" (saltati, origine sconosciuta: {})", skipped.join(", ")));
             }
             reply(StatusCode::OK, true, msg)
+        }
+        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
+    }
+}
+
+// ── Handler Storico ───────────────────────────────────────────────
+async fn get_history(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let entries = read_history(&state.config);
+    let undone: BTreeSet<String> = entries.iter().filter_map(|e| e.undo_of.clone()).collect();
+    let view: Vec<HistoryView> = entries
+        .into_iter()
+        .rev()
+        .take(200)
+        .map(|e| {
+            let u = undone.contains(&e.id);
+            HistoryView { entry: e, undone: u }
+        })
+        .collect();
+    Json(ApiResponse {
+        success: true,
+        message: format!("{} modifiche", view.len()),
+        data: Some(view),
+    })
+}
+
+// Annulla una modifica: solo se i domini interessati sono ancora come li ha
+// lasciati, così non si cancella una modifica fatta dopo (anche dai Plesk)
+async fn undo_change(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let _lock = match lock_maps() {
+        Ok(l) => l,
+        Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
+    };
+    let entries = read_history(&state.config);
+    let Some(entry) = entries.iter().find(|e| e.id == id) else {
+        return reply(StatusCode::NOT_FOUND, false, format!("Modifica {} non trovata", id));
+    };
+    if entries.iter().any(|e| e.undo_of.as_deref() == Some(id.as_str())) {
+        return reply(StatusCode::CONFLICT, false, "Modifica già annullata".to_string());
+    }
+    let old = read_domains(&state.config);
+    let current: HashMap<&str, MapEntry> = old.iter().map(|d| (d.name.as_str(), entry_of(d))).collect();
+    let changed: Vec<&str> = entry
+        .changes
+        .iter()
+        .filter(|c| current.get(c.domain.as_str()) != c.after.as_ref())
+        .map(|c| c.domain.as_str())
+        .collect();
+    if !changed.is_empty() {
+        return reply(
+            StatusCode::CONFLICT,
+            false,
+            format!("Non annullabile: modificati di nuovo dopo: {}", changed.join(", ")),
+        );
+    }
+    let mut new = old.clone();
+    for c in &entry.changes {
+        new.retain(|d| d.name != c.domain);
+        if let Some(b) = &c.before {
+            new.push(Domain { name: c.domain.clone(), backend: b.backend.clone(), origin: b.origin.clone() });
+        }
+    }
+    // Ordine del file invariato per i domini rimasti, quelli rimessi in fondo
+    let pos: HashMap<&str, usize> = old.iter().enumerate().map(|(i, d)| (d.name.as_str(), i)).collect();
+    new.sort_by_key(|d| pos.get(d.name.as_str()).copied().unwrap_or(usize::MAX));
+    let action = format!("Annullato: {}", entry.action);
+    match commit_change(&state.config, &old, &new, &action, Some(id.clone())) {
+        Ok(_) => {
+            log_action(&state.config, "UNDO", &entry.action, &id);
+            reply(StatusCode::OK, true, action)
         }
         Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     }
@@ -573,7 +897,7 @@ async fn haproxy_reload(
 }
 
 async fn haproxy_status(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> impl IntoResponse {
     let output = Command::new("systemctl")
         .args(["is-active", "haproxy"])
@@ -607,7 +931,6 @@ async fn get_logs(
 }
 
 // ── Serve file statici da UI_DIR ──────────────────────────────────
-#[allow(unused_variables)]
 async fn serve_index(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -618,6 +941,14 @@ async fn serve_static(
     State(state): State<AppState>,
     Path(filename): Path<String>,
 ) -> impl IntoResponse {
+    // Solo file di UI_DIR: niente "/" né ".." (il nome arriva già decodificato,
+    // %2e%2e%2f diventerebbe ../)
+    let safe = !filename.is_empty()
+        && !filename.starts_with('.')
+        && filename.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if !safe {
+        return (StatusCode::NOT_FOUND, "File non trovato").into_response();
+    }
     let mime = if filename.ends_with(".css") {
         "text/css"
     } else if filename.ends_with(".js") {
@@ -642,23 +973,53 @@ async fn serve_file(config: &Config, filename: &str, mime: &str) -> Response {
     }
 }
 
+// `haproxy-manager hash-password`: legge la password da stdin e stampa
+// l'hash per ADMIN_PASS_HASH (nel .env tra apici singoli: contiene "$")
+fn hash_password() {
+    let mut pass = String::new();
+    std::io::stdin().read_line(&mut pass).expect("lettura da stdin");
+    let pass = pass.trim_end_matches(['\n', '\r']);
+    if pass.is_empty() {
+        eprintln!("Password vuota");
+        std::process::exit(1);
+    }
+    if pass.chars().count() < 12 {
+        eprintln!("Attenzione: password corta, meglio almeno 12 caratteri");
+    }
+    println!("{}", bcrypt::hash(pass, 12).expect("bcrypt"));
+}
+
 // ── Main ──────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("hash-password") {
+        return hash_password();
+    }
+
     tracing_subscriber::fmt::init();
-    
+
     let config = load_config();
-    
+
     tracing::info!("Configuration loaded:");
     tracing::info!("  Listen address: {}", config.listen_addr);
     tracing::info!("  Domains map: {}", config.domains_map);
     tracing::info!("  HAProxy config: {}", config.haproxy_cfg);
     tracing::info!("  Log file: {}", config.log_file);
+    tracing::info!("  History: {}", config.history_file);
     tracing::info!("  UI directory: {}", config.ui_dir);
-    tracing::info!("  Varnish admin: {}", config.varnish_adm);
+    tracing::info!("  Helper: {}", config.helper);
+    if config.admin_pass_hash.is_none() {
+        if config.admin_pass.is_some() {
+            tracing::warn!("ADMIN_PASS in chiaro: meglio ADMIN_PASS_HASH (haproxy-manager hash-password)");
+        } else {
+            tracing::warn!("Né ADMIN_PASS_HASH né ADMIN_PASS impostati: login impossibile");
+        }
+    }
 
     let state = AppState {
-        sessions: Arc::new(RwLock::new(HashMap::new())),
+        sessions:    Arc::new(RwLock::new(HashMap::new())),
+        login_guard: Arc::new(Mutex::new(LoginGuard::default())),
+        cert_cache:  Arc::new(Mutex::new(None)),
         config,
     };
 
@@ -675,6 +1036,9 @@ async fn main() {
         .route("/api/domains/bulk",        post(bulk_update))
         .route("/api/domains/{domain}",    put(update_domain))
         .route("/api/domains/{domain}",    delete(delete_domain))
+        // Storico
+        .route("/api/history",             get(get_history))
+        .route("/api/history/{id}/undo",   post(undo_change))
         // Cache Varnish
         .route("/api/cache/purge",         post(purge_cache))
         // Backend

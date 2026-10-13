@@ -1,0 +1,42 @@
+#!/bin/bash
+# =============================================
+# /usr/local/sbin/haproxy-manager-helper (root:root 0755)
+# Le sole operazioni da root di haproxy-manager, che gira come utente
+# haproxy-manager e lo chiama con sudo (deploy/sudoers).
+#
+#   check            haproxy -c
+#   reload           haproxy -c e reload
+#   purge <dominio>  ban Varnish di dominio e www.dominio
+#   certs            "<file> <nome> <nome>…" per ogni certificato in /etc/haproxy/certs
+# =============================================
+set -euo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CFG=/etc/haproxy/haproxy.cfg
+
+case "${1:-}" in
+    check)
+        haproxy -c -q -f "$CFG"
+        ;;
+    reload)
+        haproxy -c -q -f "$CFG"
+        systemctl reload haproxy
+        ;;
+    purge)
+        D="${2:-}"
+        [[ "$D" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$ ]] ||
+            { echo "dominio non valido" >&2; exit 2; }
+        varnishadm ban "req.http.host ~ ^(www[.])?${D//./[.]}\$"
+        ;;
+    certs)
+        for f in /etc/haproxy/certs/*.pem; do
+            [ -f "$f" ] || continue
+            names=$(openssl x509 -noout -ext subjectAltName -in "$f" 2>/dev/null |
+                grep -o 'DNS:[^,[:space:]]*' | cut -c5- | tr '\n' ' ')
+            echo "${f##*/} $names"
+        done
+        ;;
+    *)
+        echo "uso: $0 check|reload|purge <dominio>|certs" >&2
+        exit 2
+        ;;
+esac
