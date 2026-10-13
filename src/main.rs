@@ -33,6 +33,7 @@ fn load_config() -> Config {
     
     Config {
         domains_map: std::env::var("DOMAINS_MAP").unwrap_or_else(|_| "/etc/haproxy/maps/domains.map".to_string()),
+        backends_map: std::env::var("BACKENDS_MAP").unwrap_or_else(|_| "/etc/haproxy/maps/backends.map".to_string()),
         haproxy_cfg: std::env::var("HAPROXY_CFG").unwrap_or_else(|_| "/etc/haproxy/haproxy.cfg".to_string()),
         log_file: std::env::var("LOG_FILE").unwrap_or_else(|_| "/var/log/haproxy-manager.log".to_string()),
         listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
@@ -46,6 +47,7 @@ fn load_config() -> Config {
 #[derive(Clone)]
 struct Config {
     domains_map: String,
+    backends_map: String,
     haproxy_cfg: String,
     log_file: String,
     listen_addr: String,
@@ -56,16 +58,26 @@ struct Config {
 }
 
 // ── Strutture ─────────────────────────────────────────────────────
+// Backend che passa da Varnish: il server di origine è in backends.map
+const VARNISH_BACKEND: &str = "varnish_backend";
+// Stesso lock di /usr/local/sbin/haproxy-domain (script degli eventi Plesk)
+const MAPS_LOCK: &str = "/run/lock/haproxy-maps.lock";
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Domain {
     name:    String,
     backend: String,
+    // Server di origine (backends.map): uguale a backend se diretto
+    #[serde(default)]
+    origin:  Option<String>,
 }
 
 #[derive(Deserialize)]
 struct DomainRequest {
     name:    String,
     backend: String,
+    #[serde(default)]
+    origin:  Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,18 +105,15 @@ struct AppState {
 }
 
 // ── File I/O ──────────────────────────────────────────────────────
-fn read_domains(config: &Config) -> Vec<Domain> {
-    let content = fs::read_to_string(&config.domains_map).unwrap_or_default();
+fn read_map(path: &str) -> Vec<(String, String)> {
+    let content = fs::read_to_string(path).unwrap_or_default();
     content
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
-                Some(Domain {
-                    name:    parts[0].to_string(),
-                    backend: parts[1].to_string(),
-                })
+                Some((parts[0].to_string(), parts[1].to_string()))
             } else {
                 None
             }
@@ -112,13 +121,106 @@ fn read_domains(config: &Config) -> Vec<Domain> {
         .collect()
 }
 
-fn write_domains(config: &Config, domains: &[Domain]) -> Result<(), String> {
-    let content = domains
+// domains.map (backend del frontend) + backends.map (origine dietro Varnish)
+fn read_domains(config: &Config) -> Vec<Domain> {
+    let origins: HashMap<String, String> = read_map(&config.backends_map).into_iter().collect();
+    read_map(&config.domains_map)
+        .into_iter()
+        .map(|(name, backend)| {
+            let origin = origins.get(&name).cloned().or_else(|| {
+                (backend != VARNISH_BACKEND).then(|| backend.clone())
+            });
+            Domain { name, backend, origin }
+        })
+        .collect()
+}
+
+// Scrive su file temporaneo e rinomina: HAProxy e il sync verso lo slave
+// non leggono mai un file a metà
+fn write_map(path: &str, entries: &[(&str, &str)]) -> Result<(), String> {
+    let content: String = entries
         .iter()
-        .map(|d| format!("{:<50} {}", d.name, d.backend))
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(&config.domains_map, content + "\n").map_err(|e| e.to_string())
+        .map(|(k, v)| format!("{:<50} {}\n", k, v))
+        .collect();
+    let tmp = format!("{}.tmp", path);
+    fs::write(&tmp, content).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn write_domains(config: &Config, domains: &[Domain]) -> Result<(), String> {
+    let front: Vec<(&str, &str)> = domains.iter().map(|d| (d.name.as_str(), d.backend.as_str())).collect();
+    let origins: Vec<(&str, &str)> = domains
+        .iter()
+        .filter_map(|d| d.origin.as_deref().map(|o| (d.name.as_str(), o)))
+        .collect();
+    // Prima backends.map: un dominio appena messo su Varnish trova già l'origine
+    write_map(&config.backends_map, &origins)?;
+    write_map(&config.domains_map, &front)
+}
+
+// Lock condiviso con lo script degli eventi Plesk per la lettura-modifica-scrittura
+fn lock_maps() -> Result<fs::File, String> {
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(MAPS_LOCK)
+        .map_err(|e| e.to_string())?;
+    f.lock().map_err(|e| e.to_string())?;
+    Ok(f)
+}
+
+// Nome esatto come lo cerca HAProxy: minuscolo, senza "www." (lo toglie HAProxy)
+fn normalize_domain(name: &str) -> Result<String, String> {
+    let n = name.trim().trim_end_matches('.').to_lowercase();
+    if n.starts_with("www.") {
+        return Err(format!("{}: inserire il dominio senza www. (www. segue sempre il dominio)", n));
+    }
+    let valid = n.len() <= 253
+        && n.contains('.')
+        && n.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if valid { Ok(n) } else { Err(format!("Nome di dominio non valido: {}", name)) }
+}
+
+fn list_backends(config: &Config) -> Vec<String> {
+    let content = fs::read_to_string(&config.haproxy_cfg).unwrap_or_default();
+    content
+        .lines()
+        .filter(|l| l.trim().starts_with("backend "))
+        .map(|l| l.trim().replace("backend ", ""))
+        .collect()
+}
+
+// Origine per un dominio: se diretto è il backend stesso; se passa da Varnish
+// quella richiesta, altrimenti quella già nota o il backend diretto precedente
+fn resolve_origin(
+    config: &Config,
+    backend: &str,
+    requested: Option<&str>,
+    previous: Option<&Domain>,
+) -> Result<String, String> {
+    let known = list_backends(config);
+    if !known.iter().any(|b| b == backend) {
+        return Err(format!("Backend sconosciuto: {}", backend));
+    }
+    if backend != VARNISH_BACKEND {
+        return Ok(backend.to_string());
+    }
+    let origin = requested
+        .filter(|o| !o.is_empty())
+        .map(|o| o.to_string())
+        .or_else(|| previous.and_then(|d| d.origin.clone()))
+        .ok_or_else(|| "Con varnish_backend va indicato il server di origine".to_string())?;
+    if origin == VARNISH_BACKEND || !known.iter().any(|b| *b == origin) {
+        return Err(format!("Server di origine non valido: {}", origin));
+    }
+    Ok(origin)
 }
 
 fn reload_haproxy(config: &Config) -> Result<String, String> {
@@ -142,7 +244,7 @@ fn reload_haproxy(config: &Config) -> Result<String, String> {
 
 fn log_action(config: &Config, action: &str, domain: &str, detail: &str) {
     let line = format!(
-        "[{}] {} | {} → {}\n",
+        "[{}] {} | {} → {}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         action, domain, detail
     );
@@ -156,8 +258,11 @@ fn log_action(config: &Config, action: &str, domain: &str, detail: &str) {
 }
 
 fn purge_varnish_cache(config: &Config, domain: &str) -> Result<String, String> {
+    // Anche www.: Varnish tiene in cache l'Host così come arriva
+    let domain = normalize_domain(domain)?;
+    let expr = format!("req.http.host ~ ^(www[.])?{}$", domain.replace('.', "[.]"));
     let output = Command::new(&config.varnish_adm)
-        .args(["ban", &format!("req.http.host == {}", domain)])
+        .args(["ban", &expr])
         .output()
         .map_err(|e| e.to_string())?;
     
@@ -274,45 +379,41 @@ async fn get_domains(
     })
 }
 
+fn reply(status: StatusCode, success: bool, message: String) -> Response {
+    (status, Json(ApiResponse::<()> { success, message, data: None })).into_response()
+}
+
 async fn add_domain(
     State(state): State<AppState>,
     Json(req): Json<DomainRequest>,
 ) -> impl IntoResponse {
+    let name = match normalize_domain(&req.name) {
+        Ok(n) => n,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
+    };
+    let _lock = match lock_maps() {
+        Ok(l) => l,
+        Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
+    };
     let mut domains = read_domains(&state.config);
-    if domains.iter().any(|d| d.name == req.name) {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::<()> {
-                success: false,
-                message: format!("Dominio {} già esistente", req.name),
-                data: None,
-            }),
-        )
-            .into_response();
+    if domains.iter().any(|d| d.name == name) {
+        return reply(StatusCode::CONFLICT, false, format!("Dominio {} già esistente", name));
     }
+    let origin = match resolve_origin(&state.config, &req.backend, req.origin.as_deref(), None) {
+        Ok(o) => o,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
+    };
     domains.push(Domain {
-        name:    req.name.clone(),
+        name:    name.clone(),
         backend: req.backend.clone(),
+        origin:  Some(origin.clone()),
     });
     match write_domains(&state.config, &domains) {
         Ok(_) => {
-            log_action(&state.config, "ADD", &req.name, &req.backend);
-            Json(ApiResponse::<()> {
-                success: true,
-                message: format!("Dominio {} aggiunto", req.name),
-                data: None,
-            })
-            .into_response()
+            log_action(&state.config, "ADD", &name, &format!("{} (origine {})", req.backend, origin));
+            reply(StatusCode::OK, true, format!("Dominio {} aggiunto", name))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()> {
-                success: false,
-                message: e,
-                data: None,
-            }),
-        )
-            .into_response(),
+        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     }
 }
 
@@ -321,41 +422,28 @@ async fn update_domain(
     Path(domain): Path<String>,
     Json(req): Json<DomainRequest>,
 ) -> impl IntoResponse {
+    let _lock = match lock_maps() {
+        Ok(l) => l,
+        Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
+    };
     let mut domains = read_domains(&state.config);
-    match domains.iter_mut().find(|d| d.name == domain) {
-        Some(d) => {
-            let old = d.backend.clone();
-            d.backend = req.backend.clone();
-            match write_domains(&state.config, &domains) {
-                Ok(_) => {
-                    log_action(&state.config, "UPDATE", &domain, &format!("{} → {}", old, req.backend));
-                    Json(ApiResponse::<()> {
-                        success: true,
-                        message: format!("Backend: {} → {}", old, req.backend),
-                        data: None,
-                    })
-                    .into_response()
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiResponse::<()> {
-                        success: false,
-                        message: e,
-                        data: None,
-                    }),
-                )
-                    .into_response(),
-            }
+    let Some(d) = domains.iter_mut().find(|d| d.name == domain) else {
+        return reply(StatusCode::NOT_FOUND, false, format!("Dominio {} non trovato", domain));
+    };
+    let origin = match resolve_origin(&state.config, &req.backend, req.origin.as_deref(), Some(d)) {
+        Ok(o) => o,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
+    };
+    let old = format!("{} (origine {})", d.backend, d.origin.as_deref().unwrap_or("-"));
+    let new = format!("{} (origine {})", req.backend, origin);
+    d.backend = req.backend.clone();
+    d.origin = Some(origin);
+    match write_domains(&state.config, &domains) {
+        Ok(_) => {
+            log_action(&state.config, "UPDATE", &domain, &format!("{} → {}", old, new));
+            reply(StatusCode::OK, true, format!("Backend: {} → {}", old, new))
         }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()> {
-                success: false,
-                message: format!("Dominio {} non trovato", domain),
-                data: None,
-            }),
-        )
-            .into_response(),
+        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     }
 }
 
@@ -363,39 +451,22 @@ async fn delete_domain(
     State(state): State<AppState>,
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
+    let _lock = match lock_maps() {
+        Ok(l) => l,
+        Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
+    };
     let mut domains = read_domains(&state.config);
     let before = domains.len();
     domains.retain(|d| d.name != domain);
     if domains.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::<()> {
-                success: false,
-                message: format!("Dominio {} non trovato", domain),
-                data: None,
-            }),
-        )
-            .into_response();
+        return reply(StatusCode::NOT_FOUND, false, format!("Dominio {} non trovato", domain));
     }
     match write_domains(&state.config, &domains) {
         Ok(_) => {
             log_action(&state.config, "DELETE", &domain, "-");
-            Json(ApiResponse::<()> {
-                success: true,
-                message: format!("Dominio {} rimosso", domain),
-                data: None,
-            })
-            .into_response()
+            reply(StatusCode::OK, true, format!("Dominio {} rimosso", domain))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()> {
-                success: false,
-                message: e,
-                data: None,
-            }),
-        )
-            .into_response(),
+        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     }
 }
 
@@ -403,33 +474,36 @@ async fn bulk_update(
     State(state): State<AppState>,
     Json(req): Json<BulkRequest>,
 ) -> impl IntoResponse {
+    let _lock = match lock_maps() {
+        Ok(l) => l,
+        Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
+    };
     let mut domains = read_domains(&state.config);
     let mut updated = 0;
+    let mut skipped = Vec::new();
     for name in &req.domains {
         if let Some(d) = domains.iter_mut().find(|d| &d.name == name) {
-            d.backend = req.backend.clone();
-            updated += 1;
+            // Verso Varnish ogni dominio tiene la sua origine
+            match resolve_origin(&state.config, &req.backend, None, Some(d)) {
+                Ok(o) => {
+                    d.backend = req.backend.clone();
+                    d.origin = Some(o);
+                    updated += 1;
+                }
+                Err(_) => skipped.push(name.clone()),
+            }
         }
     }
     match write_domains(&state.config, &domains) {
         Ok(_) => {
             log_action(&state.config, "BULK", &format!("{} domini", updated), &req.backend);
-            Json(ApiResponse::<()> {
-                success: true,
-                message: format!("{} domini → {}", updated, req.backend),
-                data: None,
-            })
-            .into_response()
+            let mut msg = format!("{} domini → {}", updated, req.backend);
+            if !skipped.is_empty() {
+                msg.push_str(&format!(" (saltati, origine sconosciuta: {})", skipped.join(", ")));
+            }
+            reply(StatusCode::OK, true, msg)
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()> {
-                success: false,
-                message: e,
-                data: None,
-            }),
-        )
-            .into_response(),
+        Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     }
 }
 
@@ -464,12 +538,7 @@ async fn purge_cache(
 async fn get_backends(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let content = fs::read_to_string(&state.config.haproxy_cfg).unwrap_or_default();
-    let backends: Vec<String> = content
-        .lines()
-        .filter(|l| l.trim().starts_with("backend "))
-        .map(|l| l.trim().replace("backend ", ""))
-        .collect();
+    let backends = list_backends(&state.config);
     Json(ApiResponse {
         success: true,
         message: format!("{} backend trovati", backends.len()),

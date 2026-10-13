@@ -113,7 +113,8 @@
       <div class="panel-body">
         <div class="form-row">
           <input class="grow" type="text" id="new-domain" placeholder="esempio.it">
-          <select id="new-backend"></select>
+          <select id="new-backend" onchange="toggleNewOrigin()"></select>
+          <select id="new-origin" title="Server di origine dietro Varnish" style="display:none"></select>
           <button class="btn btn-primary" onclick="addDomain()">Aggiungi</button>
         </div>
       </div>
@@ -144,6 +145,7 @@
                 <th><input type="checkbox" id="select-all" onchange="toggleAll(this)"></th>
                 <th>Dominio</th>
                 <th>Backend</th>
+                <th>Origine</th>
                 <th>Azioni</th>
               </tr>
             </thead>
@@ -174,7 +176,9 @@
 
 <script>
 let token = localStorage.getItem('hm_token') || '';
-let allDomains = [], backends = [], filtered = [];
+let allDomains = [], backends = [], origins = [], filtered = [];
+// Backend selezionabili come origine dietro Varnish (i server Plesk)
+const VARNISH = 'varnish_backend';
 let page = 1;
 const PAGE_SIZE = 50;
 let selected = new Set();
@@ -233,7 +237,10 @@ async function loadBackends() {
   const res = await api('/api/backends');
   if (!res.success) return;
   backends = res.data;
+  origins = backends.filter(b => b !== VARNISH && b !== 'default_backend');
   document.getElementById('stat-backends').textContent = backends.length;
+  document.getElementById('new-origin').innerHTML = origins.map(b => `<option value="${b}">${b}</option>`).join('');
+  toggleNewOrigin();
   ['new-backend','bulk-backend'].forEach(id => {
     const sel = document.getElementById(id);
     sel.innerHTML = backends.map(b => `<option value="${b}">${b}</option>`).join('');
@@ -261,8 +268,8 @@ function filterDomains() {
   const q = document.getElementById('search').value.toLowerCase();
   const b = document.getElementById('filter-backend').value;
   filtered = allDomains.filter(d =>
-    (!q || d.name.toLowerCase().includes(q) || d.backend.toLowerCase().includes(q)) &&
-    (!b || d.backend === b)
+    (!q || d.name.toLowerCase().includes(q) || d.backend.toLowerCase().includes(q) || (d.origin||'').toLowerCase().includes(q)) &&
+    (!b || d.backend === b || d.origin === b)
   );
   page = 1;
   renderTable();
@@ -278,10 +285,14 @@ function renderTable() {
         onchange="toggleSelect('${d.name}', this.checked)"></td>
       <td class="domain-name">${d.name}</td>
       <td><span class="badge ${badgeClass(d.backend)}">${d.backend}</span></td>
+      <td>${d.origin ? `<span class="badge ${badgeClass(d.origin)}">${d.origin}</span>` : '<span style="color:var(--red)">mancante</span>'}</td>
       <td>
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-          <select class="backend-select" id="sel-${d.name.replace(/[^a-z0-9]/gi,'_')}">
+          <select class="backend-select" id="sel-${rowId(d.name)}" onchange="toggleRowOrigin('${d.name}')">
             ${backends.map(b => `<option value="${b}" ${b===d.backend?'selected':''}>${b}</option>`).join('')}
+          </select>
+          <select class="backend-select" id="org-${rowId(d.name)}" title="Server di origine dietro Varnish" style="${d.backend===VARNISH?'':'display:none'}">
+            ${origins.map(b => `<option value="${b}" ${b===d.origin?'selected':''}>${b}</option>`).join('')}
           </select>
           <button class="btn btn-primary btn-sm" onclick="updateDomain('${d.name}')">✓</button>
           <button class="btn btn-danger btn-sm" onclick="deleteDomain('${d.name}')">✕</button>
@@ -293,6 +304,19 @@ function renderTable() {
   document.getElementById('page-info').textContent = `Pagina ${page}/${pages||1} — ${filtered.length} domini`;
 }
 
+function rowId(name) { return name.replace(/[^a-z0-9]/gi, '_'); }
+
+// Il server di origine serve solo quando il dominio passa da Varnish
+function toggleNewOrigin() {
+  const varnish = document.getElementById('new-backend').value === VARNISH;
+  document.getElementById('new-origin').style.display = varnish ? '' : 'none';
+}
+
+function toggleRowOrigin(name) {
+  const varnish = document.getElementById('sel-' + rowId(name)).value === VARNISH;
+  document.getElementById('org-' + rowId(name)).style.display = varnish ? '' : 'none';
+}
+
 function badgeClass(b) {
   if (b.includes('varnish')) return 'badge-varnish';
   if (b.includes('server'))  return 'badge-server';
@@ -302,16 +326,17 @@ function badgeClass(b) {
 async function addDomain() {
   const name    = document.getElementById('new-domain').value.trim();
   const backend = document.getElementById('new-backend').value;
+  const origin  = backend === VARNISH ? document.getElementById('new-origin').value : null;
   if (!name) return toast('Inserisci un dominio', 'error');
-  const res = await api('/api/domains', 'POST', {name, backend});
+  const res = await api('/api/domains', 'POST', {name, backend, origin});
   toast(res.message, res.success ? 'success' : 'error');
   if (res.success) { document.getElementById('new-domain').value = ''; loadDomains(); }
 }
 
 async function updateDomain(name) {
-  const selId = 'sel-' + name.replace(/[^a-z0-9]/gi, '_');
-  const backend = document.getElementById(selId).value;
-  const res = await api(`/api/domains/${encodeURIComponent(name)}`, 'PUT', {name, backend});
+  const backend = document.getElementById('sel-' + rowId(name)).value;
+  const origin  = backend === VARNISH ? document.getElementById('org-' + rowId(name)).value : null;
+  const res = await api(`/api/domains/${encodeURIComponent(name)}`, 'PUT', {name, backend, origin});
   toast(res.message, res.success ? 'success' : 'error');
   if (res.success) loadDomains();
 }
