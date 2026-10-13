@@ -190,7 +190,9 @@ async function api(path, method = 'GET', body = null, noAuth = false) {
   if (body) opts.body = JSON.stringify(body);
   try {
     const res = await fetch(path, opts);
-    if (res.status === 401) { doLogout(); return {success: false}; }
+    // Sessione scaduta (es. manager riavviato): solo pagina di login, senza
+    // chiamare /auth/logout, che con il token vecchio darebbe di nuovo 401
+    if (res.status === 401 && !noAuth) { showLogin(); return {success: false}; }
     return await res.json();
   } catch(e) { return {success: false, message: e.toString()}; }
 }
@@ -211,7 +213,12 @@ async function doLogin() {
 }
 
 async function doLogout() {
-  await api('/auth/logout', 'POST');
+  const old = token;
+  showLogin();
+  if (old) fetch('/auth/logout', {method: 'POST', headers: {'X-Session-Token': old}}).catch(() => {});
+}
+
+function showLogin() {
   token = '';
   localStorage.removeItem('hm_token');
   document.getElementById('app').style.display = 'none';
@@ -224,13 +231,18 @@ function showApp() {
   init();
 }
 
+let timersStarted = false;
 async function init() {
   await loadBackends();
   await loadDomains();
   await loadLogs();
   await checkStatus();
-  setInterval(checkStatus, 30000);
-  setInterval(loadLogs, 60000);
+  // una sola volta, anche dopo logout e nuovo login; da sloggati non chiamano le API
+  if (!timersStarted) {
+    timersStarted = true;
+    setInterval(() => { if (token) checkStatus(); }, 30000);
+    setInterval(() => { if (token) loadLogs(); }, 60000);
+  }
 }
 
 async function loadBackends() {
@@ -430,7 +442,7 @@ document.getElementById('login-pass').addEventListener('keydown', e => {
 if (token) {
   api('/api/domains').then(res => {
     if (res.success) showApp();
-    else { token = ''; localStorage.removeItem('hm_token'); }
+    else showLogin();
   });
 }
 </script>
