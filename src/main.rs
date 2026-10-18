@@ -916,6 +916,38 @@ async fn add_backend(
     }
 }
 
+// Rimozione: l'helper la rifiuta se un dominio (diretto o come origine dietro
+// Varnish) o un'altra regola di haproxy.cfg usa ancora il backend
+async fn delete_backend(
+    State(state): State<AppState>,
+    Path(backend): Path<String>,
+) -> impl IntoResponse {
+    let name = backend.strip_suffix("_backend").unwrap_or(&backend).to_string();
+    let valid = !name.is_empty()
+        && name.len() <= 31
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !valid {
+        return reply(StatusCode::BAD_REQUEST, false, format!("Backend non valido: {}", backend));
+    }
+    let config = state.config.clone();
+    let n = name.clone();
+    let res = tokio::task::spawn_blocking(move || run_helper(&config, &["remove-backend", &n]))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match res {
+        Ok(out) => {
+            log_action(&state.config, "BACKEND-DEL", &format!("{}_backend", name), "-");
+            let warn: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut msg = format!("Backend {}_backend rimosso", name);
+            if !warn.is_empty() {
+                msg.push_str(&format!(" — {}", warn.join("; ")));
+            }
+            reply(StatusCode::OK, true, msg)
+        }
+        Err(e) => reply(StatusCode::BAD_REQUEST, false, e),
+    }
+}
+
 // ── Handler Sistema ───────────────────────────────────────────────
 async fn haproxy_reload(
     State(state): State<AppState>,
@@ -1090,6 +1122,7 @@ async fn main() {
         // Backend
         .route("/api/backends",            get(get_backends))
         .route("/api/backends",            post(add_backend))
+        .route("/api/backends/{backend}",  delete(delete_backend))
         // Sistema
         .route("/api/haproxy/reload",      post(haproxy_reload))
         .route("/api/haproxy/status",      get(haproxy_status))

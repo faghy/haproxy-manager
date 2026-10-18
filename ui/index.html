@@ -129,7 +129,7 @@
     </div>
 
     <div class="panel">
-      <div class="panel-header"><h2>🖥️ Aggiungi Server (backend)</h2></div>
+      <div class="panel-header"><h2>🖥️ Server (backend)</h2></div>
       <div class="panel-body">
         <div class="form-row">
           <input type="text" id="new-server-ip" placeholder="IP WireGuard, es. 10.100.0.7" oninput="suggestServerName()">
@@ -140,6 +140,7 @@
           Server Plesk raggiungibile via WireGuard, siti in HTTPS sull'IP indicato (porta 443).
           La modifica va subito anche sullo slave e nella repo.
         </div>
+        <div id="backend-list" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"></div>
       </div>
     </div>
 
@@ -294,6 +295,7 @@ async function loadBackends() {
   const fb = document.getElementById('filter-backend');
   fb.innerHTML = '<option value="">Tutti i backend</option>' +
     backends.map(b => `<option value="${b}">${b}</option>`).join('');
+  renderBackendList();
 }
 
 async function loadDomains() {
@@ -302,6 +304,29 @@ async function loadDomains() {
   allDomains = res.data;
   filterDomains();
   updateStats();
+  renderBackendList();
+}
+
+// Server con il numero di domini che li usano (diretti o come origine dietro
+// Varnish): si possono togliere solo quelli inutilizzati
+const SERVICE_BACKENDS = [VARNISH, 'default_backend', 'grafana_backend'];
+function renderBackendList() {
+  const el = document.getElementById('backend-list');
+  if (!el) return;
+  el.innerHTML = backends.filter(b => !SERVICE_BACKENDS.includes(b)).map(b => {
+    const n = allDomains.filter(d => d.backend === b || d.origin === b).length;
+    const del = n === 0
+      ? `<button class="btn btn-danger btn-sm" title="Rimuovi ${esc(b)}" onclick="deleteBackend('${esc(b)}')">✕</button>`
+      : '';
+    return `<span class="badge badge-server" style="display:inline-flex;align-items:center;gap:8px">${esc(b)} · ${n} domini ${del}</span>`;
+  }).join('');
+}
+
+async function deleteBackend(b) {
+  if (!confirm(`Rimuovere ${b} da HAProxy (master, slave e repo)?`)) return;
+  const res = await api(`/api/backends/${encodeURIComponent(b)}`, 'DELETE');
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) { await loadBackends(); refresh(); }
 }
 
 function updateStats() {
