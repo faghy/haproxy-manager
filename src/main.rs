@@ -40,6 +40,7 @@ fn load_config() -> Config {
         haproxy_cfg: std::env::var("HAPROXY_CFG").unwrap_or_else(|_| "/etc/haproxy/haproxy.cfg".to_string()),
         log_file: std::env::var("LOG_FILE").unwrap_or_else(|_| "/var/log/haproxy-manager.log".to_string()),
         history_file: std::env::var("HISTORY_FILE").unwrap_or_else(|_| "/var/lib/haproxy-manager/history.jsonl".to_string()),
+        colors_file:  std::env::var("COLORS_FILE").unwrap_or_else(|_| "/var/lib/haproxy-manager/backend-colors.json".to_string()),
         listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
         admin_user: std::env::var("ADMIN_USER").unwrap_or_else(|_| "admin".to_string()),
         admin_pass_hash: std::env::var("ADMIN_PASS_HASH").ok().filter(|s| !s.is_empty()),
@@ -56,6 +57,8 @@ struct Config {
     haproxy_cfg: String,
     log_file: String,
     history_file: String,
+    // Colore dell'etichetta di ogni backend nella UI (solo interfaccia)
+    colors_file: String,
     listen_addr: String,
     admin_user: String,
     // Hash bcrypt (haproxy-manager hash-password); ADMIN_PASS in chiaro solo come ripiego
@@ -124,18 +127,26 @@ struct BackendView {
     name:    String,
     // Indirizzo del (primo) server del backend, es. 10.100.0.5:443
     address: Option<String>,
+    // Colore dell'etichetta, "#rrggbb"
+    color:   Option<String>,
 }
 
+// Modifica: nuovo IP e/o colore (il colore non tocca HAProxy)
 #[derive(Deserialize)]
-struct BackendIpRequest {
-    ip: String,
+struct BackendUpdateRequest {
+    #[serde(default)]
+    ip:    Option<String>,
+    #[serde(default)]
+    color: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct BackendRequest {
     // Nome del server (es. server7): il backend sarà server7_backend
-    name: String,
-    ip:   String,
+    name:  String,
+    ip:    String,
+    #[serde(default)]
+    color: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -294,13 +305,51 @@ fn list_backends(config: &Config) -> Vec<String> {
         .collect()
 }
 
+// ── Colori delle etichette ────────────────────────────────────────
+fn read_colors(config: &Config) -> HashMap<String, String> {
+    fs::read_to_string(&config.colors_file)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_colors(config: &Config, colors: &HashMap<String, String>) -> Result<(), String> {
+    let sorted: std::collections::BTreeMap<_, _> = colors.iter().collect();
+    let json = serde_json::to_string_pretty(&sorted).map_err(|e| e.to_string())?;
+    let tmp = format!("{}.tmp", config.colors_file);
+    fs::write(&tmp, json + "\n").map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &config.colors_file).map_err(|e| e.to_string())
+}
+
+// "#rrggbb" (minuscolo); vuoto = colore predefinito
+fn normalize_color(c: &str) -> Result<Option<String>, String> {
+    let c = c.trim().to_lowercase();
+    if c.is_empty() {
+        return Ok(None);
+    }
+    let ok = c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|x| x.is_ascii_hexdigit());
+    if ok { Ok(Some(c)) } else { Err(format!("Colore non valido: {}", c)) }
+}
+
+fn set_color(config: &Config, backend: &str, color: Option<String>) -> Result<(), String> {
+    let mut colors = read_colors(config);
+    match color {
+        Some(c) => colors.insert(backend.to_string(), c),
+        None => colors.remove(backend),
+    };
+    write_colors(config, &colors)
+}
+
 fn list_backend_details(config: &Config) -> Vec<BackendView> {
     let content = fs::read_to_string(&config.haproxy_cfg).unwrap_or_default();
+    let colors = read_colors(config);
     let mut out: Vec<BackendView> = Vec::new();
     let mut in_backend = false;
     for line in content.lines() {
         if let Some(name) = line.strip_prefix("backend ") {
-            out.push(BackendView { name: name.trim().to_string(), address: None });
+            let name = name.trim().to_string();
+            let color = colors.get(&name).cloned();
+            out.push(BackendView { name, address: None, color });
             in_backend = true;
         } else if !line.starts_with(char::is_whitespace) {
             in_backend = false;
@@ -934,6 +983,10 @@ async fn add_backend(
         Ok(ip) => ip,
         Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
     };
+    let color = match normalize_color(req.color.as_deref().unwrap_or("")) {
+        Ok(c) => c,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
+    };
     let config = state.config.clone();
     let (n, i) = (name.clone(), ip.clone());
     // haproxy -c, reload e git: fuori dal thread che serve le richieste
@@ -943,7 +996,10 @@ async fn add_backend(
     match res {
         Ok(out) => {
             log_action(&state.config, "BACKEND", &format!("{}_backend", name), &ip);
-            let warn: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut warn: Vec<String> = out.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
+            if let Err(e) = set_color(&state.config, &format!("{}_backend", name), color) {
+                warn.push(format!("colore non salvato: {}", e));
+            }
             let mut msg = format!("Backend {}_backend ({}) aggiunto", name, ip);
             if !warn.is_empty() {
                 msg.push_str(&format!(" — {}", warn.join("; ")));
@@ -965,45 +1021,63 @@ async fn get_backend_details(
     })
 }
 
-// Nuovo IP per il server di un backend (porta e opzioni invariate)
+// Modifica di un backend: nuovo IP del server (porta e opzioni invariate,
+// via helper) e/o colore dell'etichetta (solo file del manager)
 async fn update_backend(
     State(state): State<AppState>,
     Path(backend): Path<String>,
-    Json(req): Json<BackendIpRequest>,
+    Json(req): Json<BackendUpdateRequest>,
 ) -> impl IntoResponse {
     let name = backend.strip_suffix("_backend").unwrap_or(&backend).to_string();
-    let valid = !name.is_empty()
-        && name.len() <= 31
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if !valid {
-        return reply(StatusCode::BAD_REQUEST, false, format!("Backend non valido: {}", backend));
-    }
-    let ip = match parse_server_ip(&req.ip) {
+    let full = format!("{}_backend", name);
+    let Some(current) = list_backend_details(&state.config).into_iter().find(|b| b.name == full) else {
+        return reply(StatusCode::NOT_FOUND, false, format!("Il backend {} non esiste", full));
+    };
+    let color = match req.color.as_deref().map(normalize_color).transpose() {
+        Ok(c) => c,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
+    };
+    let ip = match req.ip.as_deref().map(parse_server_ip).transpose() {
         Ok(ip) => ip,
         Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
     };
-    let before = list_backend_details(&state.config)
-        .into_iter()
-        .find(|b| b.name == format!("{}_backend", name))
-        .and_then(|b| b.address)
-        .unwrap_or_else(|| "-".to_string());
-    let config = state.config.clone();
-    let (n, i) = (name.clone(), ip.clone());
-    let res = tokio::task::spawn_blocking(move || run_helper(&config, &["set-backend-ip", &n, &i]))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()));
-    match res {
-        Ok(out) if out.starts_with("nessuna modifica") => reply(StatusCode::OK, true, out),
-        Ok(out) => {
-            log_action(&state.config, "BACKEND-IP", &format!("{}_backend", name), &format!("{} → {}", before, ip));
-            let warn: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
-            let mut msg = format!("{}_backend: {} → {}", name, before, ip);
-            if !warn.is_empty() {
-                msg.push_str(&format!(" — {}", warn.join("; ")));
+    let before = current.address.clone().unwrap_or_else(|| "-".to_string());
+    let before_ip = before.split(':').next().unwrap_or("").to_string();
+    let mut done: Vec<String> = Vec::new();
+
+    // IP: solo se cambia (il solo colore non ricarica HAProxy)
+    if let Some(ip) = ip.filter(|ip| *ip != before_ip) {
+        let config = state.config.clone();
+        let (n, i) = (name.clone(), ip.clone());
+        let res = tokio::task::spawn_blocking(move || run_helper(&config, &["set-backend-ip", &n, &i]))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        match res {
+            Ok(out) => {
+                log_action(&state.config, "BACKEND-IP", &full, &format!("{} → {}", before, ip));
+                let mut msg = format!("{}: {} → {}", full, before, ip);
+                let warn: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+                if !warn.is_empty() {
+                    msg.push_str(&format!(" — {}", warn.join("; ")));
+                }
+                done.push(msg);
             }
-            reply(StatusCode::OK, true, msg)
+            Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
         }
-        Err(e) => reply(StatusCode::BAD_REQUEST, false, e),
+    }
+
+    if let Some(color) = color.filter(|c| *c != current.color) {
+        if let Err(e) = set_color(&state.config, &full, color.clone()) {
+            return reply(StatusCode::INTERNAL_SERVER_ERROR, false, format!("Colore non salvato: {}", e));
+        }
+        log_action(&state.config, "BACKEND-COLOR", &full, color.as_deref().unwrap_or("predefinito"));
+        done.push(format!("colore di {} aggiornato", full));
+    }
+
+    if done.is_empty() {
+        reply(StatusCode::OK, true, format!("{}: nessuna modifica", full))
+    } else {
+        reply(StatusCode::OK, true, done.join("; "))
     }
 }
 
@@ -1028,6 +1102,7 @@ async fn delete_backend(
     match res {
         Ok(out) => {
             log_action(&state.config, "BACKEND-DEL", &format!("{}_backend", name), "-");
+            let _ = set_color(&state.config, &format!("{}_backend", name), None);
             let warn: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
             let mut msg = format!("Backend {}_backend rimosso", name);
             if !warn.is_empty() {
