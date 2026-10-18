@@ -11,10 +11,12 @@
 #   add-backend <nome> <ip>
 #                    nuovo backend <nome>_backend (server Plesk su <ip>:443, come
 #                    gli altri) prima di "# DEFAULT"
+#   set-backend-ip <nome> <ip>
+#                    sposta il server di <nome>_backend su <ip> (porta invariata)
 #   remove-backend <nome>
 #                    toglie <nome>_backend se nessun dominio e nessuna regola lo usa
 #
-# Per add/remove: haproxy -c sulla copia, backup in /var/backups/haproxy,
+# Per add/set-ip/remove: haproxy -c sulla copia, backup in /var/backups/haproxy,
 # reload (ripristino se fallisce), sync slave, stessa modifica nella repo.
 # Gli avvisi (non errori) vanno su stdout, gli errori su stderr.
 # =============================================
@@ -51,6 +53,24 @@ if op == "add":
     if not m:
         sys.exit("punto di inserimento (# DEFAULT) non trovato in " + src)
     s = s[:m.start()] + block + s[m.start():]
+elif op == "setip":
+    ip = sys.argv[5]
+    lines = s.splitlines(keepends=True)
+    try:
+        i = next(k for k, l in enumerate(lines) if l.rstrip() == f"backend {name}_backend")
+    except StopIteration:
+        sys.exit(f"backend {name}_backend non trovato in {src}")
+    found = 0
+    j = i + 1
+    while j < len(lines) and not re.match(r"(#|backend |frontend |defaults|global|listen )", lines[j]):
+        m = re.match(r"(\s*server\s+\S+\s+)[^\s:]+(:\d+.*)", lines[j], re.S)
+        if m:
+            lines[j] = m.group(1) + ip + m.group(2)
+            found += 1
+        j += 1
+    if found != 1:
+        sys.exit(f"backend {name}_backend: atteso un solo server, trovati {found}")
+    s = "".join(lines)
 else:
     lines = s.splitlines(keepends=True)
     try:
@@ -100,6 +120,12 @@ apply_cfg() {
     else
         echo "attenzione: repo non aggiornata"
     fi
+}
+
+# IP del (primo) server di un backend
+backend_ip() {
+    awk -v b="backend $1" '$0 == b { f = 1; next } f && /^[^ \t]/ { f = 0 }
+        f && $1 == "server" { split($3, a, ":"); print a[1]; exit }' "$CFG"
 }
 
 valid_name() {
@@ -153,6 +179,24 @@ case "${1:-}" in
         timeout 4 bash -c "</dev/tcp/$IP/443" 2>/dev/null ||
             echo "attenzione: $IP:443 non risponde ora (WireGuard/Plesk), HAProxy lo segnerà giù"
         ;;
+    set-backend-ip)
+        N="${2:-}" IP="${3:-}"
+        valid_name "$N"
+        valid_ipv4 "$IP" || { echo "Indirizzo IP non valido: $IP" >&2; exit 2; }
+        B="${N}_backend"
+        for p in $PROTECTED; do
+            [ "$B" = "$p" ] && { echo "$B è un backend di servizio, non si modifica da qui" >&2; exit 3; }
+        done
+        exec 8>/run/lock/haproxy-cfg.lock; flock 8
+        grep -qE "^backend ${B}\$" "$CFG" || { echo "Il backend $B non esiste" >&2; exit 3; }
+        CUR=$(backend_ip "$B")
+        [ "$CUR" != "$IP" ] || { echo "nessuna modifica: $B è già su $IP"; exit 0; }
+        grep -qE "^[[:space:]]*server [^ ]+ ${IP//./\\.}:" "$CFG" &&
+            { echo "$IP è già usato da un altro backend" >&2; exit 3; }
+        apply_cfg "Backend $B: $CUR → $IP (haproxy-manager)" setip "$N" "$IP"
+        timeout 4 bash -c "</dev/tcp/$IP/443" 2>/dev/null ||
+            echo "attenzione: $IP:443 non risponde ora (WireGuard/Plesk), HAProxy lo segnerà giù"
+        ;;
     remove-backend)
         N="${2:-}"
         valid_name "$N"
@@ -171,7 +215,7 @@ case "${1:-}" in
         apply_cfg "Backend $B rimosso da haproxy-manager" remove "$N"
         ;;
     *)
-        echo "uso: $0 check|reload|purge <dominio>|certs|add-backend <nome> <ip>|remove-backend <nome>" >&2
+        echo "uso: $0 check|reload|purge <dominio>|certs|add-backend <nome> <ip>|set-backend-ip <nome> <ip>|remove-backend <nome>" >&2
         exit 2
         ;;
 esac

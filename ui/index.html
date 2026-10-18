@@ -129,22 +129,6 @@
     </div>
 
     <div class="panel">
-      <div class="panel-header"><h2>🖥️ Server (backend)</h2></div>
-      <div class="panel-body">
-        <div class="form-row">
-          <input type="text" id="new-server-ip" placeholder="IP WireGuard, es. 10.100.0.7" oninput="suggestServerName()">
-          <input class="grow" type="text" id="new-server-name" placeholder="nome, es. server7 → server7_backend">
-          <button class="btn btn-primary" onclick="addBackend()">Aggiungi</button>
-        </div>
-        <div style="font-size:12px;color:#888;margin-top:-8px">
-          Server Plesk raggiungibile via WireGuard, siti in HTTPS sull'IP indicato (porta 443).
-          La modifica va subito anche sullo slave e nella repo.
-        </div>
-        <div id="backend-list" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"></div>
-      </div>
-    </div>
-
-    <div class="panel">
       <div class="panel-header">
         <h2>🌐 Domini</h2>
         <button class="btn btn-ghost btn-sm" onclick="loadDomains()">↻ Aggiorna</button>
@@ -180,6 +164,32 @@
           <button class="btn btn-ghost btn-sm" onclick="prevPage()">‹ Prec</button>
           <span class="page-info" id="page-info"></span>
           <button class="btn btn-ghost btn-sm" onclick="nextPage()">Succ ›</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <h2>🖥️ Server (backend)</h2>
+        <button class="btn btn-ghost btn-sm" onclick="loadBackends()">↻ Aggiorna</button>
+      </div>
+      <div class="panel-body">
+        <div class="form-row">
+          <input type="text" id="new-server-ip" placeholder="IP WireGuard, es. 10.100.0.7" oninput="suggestServerName()">
+          <input class="grow" type="text" id="new-server-name" placeholder="nome, es. server7 → server7_backend">
+          <button class="btn btn-primary" onclick="addBackend()">Aggiungi</button>
+        </div>
+        <div style="font-size:12px;color:#888;margin-top:-8px;margin-bottom:12px">
+          Server Plesk raggiungibile via WireGuard, siti in HTTPS sull'IP indicato (porta 443).
+          Aggiunta, modifica e rimozione vanno subito anche sullo slave e nella repo.
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Backend</th><th>Indirizzo</th><th>Domini</th><th>Azioni</th></tr>
+            </thead>
+            <tbody id="backends-table"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -295,7 +305,7 @@ async function loadBackends() {
   const fb = document.getElementById('filter-backend');
   fb.innerHTML = '<option value="">Tutti i backend</option>' +
     backends.map(b => `<option value="${b}">${b}</option>`).join('');
-  renderBackendList();
+  loadBackendDetails();
 }
 
 async function loadDomains() {
@@ -307,19 +317,68 @@ async function loadDomains() {
   renderBackendList();
 }
 
-// Server con il numero di domini che li usano (diretti o come origine dietro
-// Varnish): si possono togliere solo quelli inutilizzati
+// Server con indirizzo e numero di domini che li usano (diretti o come
+// origine dietro Varnish): si tolgono solo quelli inutilizzati; i backend di
+// servizio non si modificano da qui
 const SERVICE_BACKENDS = [VARNISH, 'default_backend', 'grafana_backend'];
+let backendDetails = [], editingBackend = null;
+
+async function loadBackendDetails() {
+  const res = await api('/api/backends/details');
+  if (res.success) backendDetails = res.data;
+  renderBackendList();
+}
+
 function renderBackendList() {
-  const el = document.getElementById('backend-list');
+  const el = document.getElementById('backends-table');
   if (!el) return;
-  el.innerHTML = backends.filter(b => !SERVICE_BACKENDS.includes(b)).map(b => {
-    const n = allDomains.filter(d => d.backend === b || d.origin === b).length;
+  el.innerHTML = backendDetails.filter(b => !SERVICE_BACKENDS.includes(b.name)).map(b => {
+    const n = allDomains.filter(d => d.backend === b.name || d.origin === b.name).length;
+    const id = rowId(b.name);
+    const addr = b.address || '-';
+    if (editingBackend === b.name) {
+      const ip = addr.split(':')[0];
+      return `<tr>
+        <td><span class="badge badge-server">${esc(b.name)}</span></td>
+        <td><input type="text" id="ip-${id}" value="${esc(ip)}" style="width:160px"
+              onkeydown="if(event.key==='Enter')saveBackend('${esc(b.name)}');if(event.key==='Escape')cancelEditBackend()"></td>
+        <td>${n}</td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-primary btn-sm" onclick="saveBackend('${esc(b.name)}')">Salva</button>
+          <button class="btn btn-ghost btn-sm" onclick="cancelEditBackend()">Annulla</button>
+        </td></tr>`;
+    }
     const del = n === 0
-      ? `<button class="btn btn-danger btn-sm" title="Rimuovi ${esc(b)}" onclick="deleteBackend('${esc(b)}')">✕</button>`
+      ? `<button class="btn btn-danger btn-sm" title="Rimuovi ${esc(b.name)}" onclick="deleteBackend('${esc(b.name)}')">✕</button>`
       : '';
-    return `<span class="badge badge-server" style="display:inline-flex;align-items:center;gap:8px">${esc(b)} · ${n} domini ${del}</span>`;
+    return `<tr>
+      <td><span class="badge badge-server">${esc(b.name)}</span></td>
+      <td><code>${esc(addr)}</code></td>
+      <td>${n}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-ghost btn-sm" title="Cambia IP" onclick="editBackend('${esc(b.name)}')">✎ Modifica</button>
+        ${del}
+      </td></tr>`;
   }).join('');
+}
+
+function editBackend(name) {
+  editingBackend = name;
+  renderBackendList();
+  const input = document.getElementById('ip-' + rowId(name));
+  if (input) { input.focus(); input.select(); }
+}
+
+function cancelEditBackend() { editingBackend = null; renderBackendList(); }
+
+async function saveBackend(name) {
+  const ip = document.getElementById('ip-' + rowId(name)).value.trim();
+  if (!ip) return toast('Inserisci un IP', 'error');
+  const n = allDomains.filter(d => d.backend === name || d.origin === name).length;
+  if (!confirm(`Spostare ${name} su ${ip}:443?` + (n ? ` I suoi ${n} domini andranno subito al nuovo indirizzo.` : ''))) return;
+  const res = await api(`/api/backends/${encodeURIComponent(name)}`, 'PUT', {ip});
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) { editingBackend = null; await loadBackends(); refresh(); }
 }
 
 async function deleteBackend(b) {

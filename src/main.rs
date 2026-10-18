@@ -119,6 +119,18 @@ struct CachePurgeRequest {
     domain: String,
 }
 
+#[derive(Serialize)]
+struct BackendView {
+    name:    String,
+    // Indirizzo del (primo) server del backend, es. 10.100.0.5:443
+    address: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BackendIpRequest {
+    ip: String,
+}
+
 #[derive(Deserialize)]
 struct BackendRequest {
     // Nome del server (es. server7): il backend sarà server7_backend
@@ -280,6 +292,33 @@ fn list_backends(config: &Config) -> Vec<String> {
         .filter(|l| l.trim().starts_with("backend "))
         .map(|l| l.trim().replace("backend ", ""))
         .collect()
+}
+
+fn list_backend_details(config: &Config) -> Vec<BackendView> {
+    let content = fs::read_to_string(&config.haproxy_cfg).unwrap_or_default();
+    let mut out: Vec<BackendView> = Vec::new();
+    let mut in_backend = false;
+    for line in content.lines() {
+        if let Some(name) = line.strip_prefix("backend ") {
+            out.push(BackendView { name: name.trim().to_string(), address: None });
+            in_backend = true;
+        } else if !line.starts_with(char::is_whitespace) {
+            in_backend = false;
+        } else if in_backend {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let (Some(&"server"), Some(addr), Some(last)) = (parts.first(), parts.get(2), out.last_mut()) {
+                last.address.get_or_insert_with(|| addr.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn parse_server_ip(raw: &str) -> Result<String, String> {
+    match raw.trim().parse::<std::net::Ipv4Addr>() {
+        Ok(ip) if !(ip.is_unspecified() || ip.is_loopback() || ip.is_broadcast() || ip.is_multicast()) => Ok(ip.to_string()),
+        _ => Err(format!("Indirizzo IP non valido: {}", raw.trim())),
+    }
 }
 
 // Origine per un dominio: se diretto è il backend stesso; se passa da Varnish
@@ -891,11 +930,10 @@ async fn add_backend(
     if !valid {
         return reply(StatusCode::BAD_REQUEST, false, "Nome non valido: lettere minuscole, cifre e -, es. server7".to_string());
     }
-    let ip = match req.ip.trim().parse::<std::net::Ipv4Addr>() {
-        Ok(ip) if !(ip.is_unspecified() || ip.is_loopback() || ip.is_broadcast() || ip.is_multicast()) => ip,
-        _ => return reply(StatusCode::BAD_REQUEST, false, format!("Indirizzo IP non valido: {}", req.ip.trim())),
+    let ip = match parse_server_ip(&req.ip) {
+        Ok(ip) => ip,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
     };
-    let ip = ip.to_string();
     let config = state.config.clone();
     let (n, i) = (name.clone(), ip.clone());
     // haproxy -c, reload e git: fuori dal thread che serve le richieste
@@ -907,6 +945,59 @@ async fn add_backend(
             log_action(&state.config, "BACKEND", &format!("{}_backend", name), &ip);
             let warn: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
             let mut msg = format!("Backend {}_backend ({}) aggiunto", name, ip);
+            if !warn.is_empty() {
+                msg.push_str(&format!(" — {}", warn.join("; ")));
+            }
+            reply(StatusCode::OK, true, msg)
+        }
+        Err(e) => reply(StatusCode::BAD_REQUEST, false, e),
+    }
+}
+
+async fn get_backend_details(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let backends = list_backend_details(&state.config);
+    Json(ApiResponse {
+        success: true,
+        message: format!("{} backend trovati", backends.len()),
+        data: Some(backends),
+    })
+}
+
+// Nuovo IP per il server di un backend (porta e opzioni invariate)
+async fn update_backend(
+    State(state): State<AppState>,
+    Path(backend): Path<String>,
+    Json(req): Json<BackendIpRequest>,
+) -> impl IntoResponse {
+    let name = backend.strip_suffix("_backend").unwrap_or(&backend).to_string();
+    let valid = !name.is_empty()
+        && name.len() <= 31
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !valid {
+        return reply(StatusCode::BAD_REQUEST, false, format!("Backend non valido: {}", backend));
+    }
+    let ip = match parse_server_ip(&req.ip) {
+        Ok(ip) => ip,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
+    };
+    let before = list_backend_details(&state.config)
+        .into_iter()
+        .find(|b| b.name == format!("{}_backend", name))
+        .and_then(|b| b.address)
+        .unwrap_or_else(|| "-".to_string());
+    let config = state.config.clone();
+    let (n, i) = (name.clone(), ip.clone());
+    let res = tokio::task::spawn_blocking(move || run_helper(&config, &["set-backend-ip", &n, &i]))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match res {
+        Ok(out) if out.starts_with("nessuna modifica") => reply(StatusCode::OK, true, out),
+        Ok(out) => {
+            log_action(&state.config, "BACKEND-IP", &format!("{}_backend", name), &format!("{} → {}", before, ip));
+            let warn: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut msg = format!("{}_backend: {} → {}", name, before, ip);
             if !warn.is_empty() {
                 msg.push_str(&format!(" — {}", warn.join("; ")));
             }
@@ -1122,6 +1213,8 @@ async fn main() {
         // Backend
         .route("/api/backends",            get(get_backends))
         .route("/api/backends",            post(add_backend))
+        .route("/api/backends/details",    get(get_backend_details))
+        .route("/api/backends/{backend}",  put(update_backend))
         .route("/api/backends/{backend}",  delete(delete_backend))
         // Sistema
         .route("/api/haproxy/reload",      post(haproxy_reload))
