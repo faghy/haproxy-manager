@@ -119,6 +119,13 @@ struct CachePurgeRequest {
     domain: String,
 }
 
+#[derive(Deserialize)]
+struct BackendRequest {
+    // Nome del server (es. server7): il backend sarà server7_backend
+    name: String,
+    ip:   String,
+}
+
 #[derive(Serialize)]
 struct ApiResponse<T: Serialize> {
     success: bool,
@@ -870,6 +877,45 @@ async fn get_backends(
     })
 }
 
+// Nuovo server Plesk: il blocco in haproxy.cfg lo scrive l'helper (root),
+// che controlla, ricarica, sincronizza lo slave e committa nella repo
+async fn add_backend(
+    State(state): State<AppState>,
+    Json(req): Json<BackendRequest>,
+) -> impl IntoResponse {
+    let name = req.name.trim().to_lowercase();
+    let name = name.strip_suffix("_backend").unwrap_or(&name).to_string();
+    let valid = name.len() <= 31
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !valid {
+        return reply(StatusCode::BAD_REQUEST, false, "Nome non valido: lettere minuscole, cifre e -, es. server7".to_string());
+    }
+    let ip = match req.ip.trim().parse::<std::net::Ipv4Addr>() {
+        Ok(ip) if !(ip.is_unspecified() || ip.is_loopback() || ip.is_broadcast() || ip.is_multicast()) => ip,
+        _ => return reply(StatusCode::BAD_REQUEST, false, format!("Indirizzo IP non valido: {}", req.ip.trim())),
+    };
+    let ip = ip.to_string();
+    let config = state.config.clone();
+    let (n, i) = (name.clone(), ip.clone());
+    // haproxy -c, reload e git: fuori dal thread che serve le richieste
+    let res = tokio::task::spawn_blocking(move || run_helper(&config, &["add-backend", &n, &i]))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match res {
+        Ok(out) => {
+            log_action(&state.config, "BACKEND", &format!("{}_backend", name), &ip);
+            let warn: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+            let mut msg = format!("Backend {}_backend ({}) aggiunto", name, ip);
+            if !warn.is_empty() {
+                msg.push_str(&format!(" — {}", warn.join("; ")));
+            }
+            reply(StatusCode::OK, true, msg)
+        }
+        Err(e) => reply(StatusCode::BAD_REQUEST, false, e),
+    }
+}
+
 // ── Handler Sistema ───────────────────────────────────────────────
 async fn haproxy_reload(
     State(state): State<AppState>,
@@ -1043,6 +1089,7 @@ async fn main() {
         .route("/api/cache/purge",         post(purge_cache))
         // Backend
         .route("/api/backends",            get(get_backends))
+        .route("/api/backends",            post(add_backend))
         // Sistema
         .route("/api/haproxy/reload",      post(haproxy_reload))
         .route("/api/haproxy/status",      get(haproxy_status))

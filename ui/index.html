@@ -129,6 +129,21 @@
     </div>
 
     <div class="panel">
+      <div class="panel-header"><h2>🖥️ Aggiungi Server (backend)</h2></div>
+      <div class="panel-body">
+        <div class="form-row">
+          <input type="text" id="new-server-ip" placeholder="IP WireGuard, es. 10.100.0.7" oninput="suggestServerName()">
+          <input class="grow" type="text" id="new-server-name" placeholder="nome, es. server7 → server7_backend">
+          <button class="btn btn-primary" onclick="addBackend()">Aggiungi</button>
+        </div>
+        <div style="font-size:12px;color:#888;margin-top:-8px">
+          Server Plesk raggiungibile via WireGuard, siti in HTTPS sull'IP indicato (porta 443).
+          La modifica va subito anche sullo slave e nella repo.
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
       <div class="panel-header">
         <h2>🌐 Domini</h2>
         <button class="btn btn-ghost btn-sm" onclick="loadDomains()">↻ Aggiorna</button>
@@ -362,6 +377,30 @@ async function addDomain() {
   const res = await api('/api/domains', 'POST', {name, backend, origin});
   toast(res.message, res.success ? 'success' : 'error');
   if (res.success) { document.getElementById('new-domain').value = ''; refresh(); }
+}
+
+// 10.100.0.N → serverN, come i server esistenti (finché il nome non è scritto a mano)
+function suggestServerName() {
+  const ip = document.getElementById('new-server-ip').value.trim();
+  const nameEl = document.getElementById('new-server-name');
+  const m = ip.match(/^10\.100\.0\.(\d{1,3})$/);
+  if (!nameEl.value || nameEl.dataset.auto === '1') {
+    nameEl.value = m ? 'server' + m[1] : '';
+    nameEl.dataset.auto = m ? '1' : '';
+  }
+}
+
+async function addBackend() {
+  const ipEl = document.getElementById('new-server-ip'), nameEl = document.getElementById('new-server-name');
+  const ip = ipEl.value.trim(), name = nameEl.value.trim();
+  if (!ip || !name) return toast('Inserisci IP e nome del server', 'error');
+  if (!confirm(`Aggiungere ${name}_backend su ${ip}:443?`)) return;
+  const res = await api('/api/backends', 'POST', {name, ip});
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) {
+    ipEl.value = ''; nameEl.value = ''; nameEl.dataset.auto = '';
+    await loadBackends(); refresh();
+  }
 }
 
 async function updateDomain(name) {

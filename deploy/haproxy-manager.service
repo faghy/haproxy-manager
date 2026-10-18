@@ -19,8 +19,11 @@ StandardError=journal
 UMask=0022
 StateDirectory=haproxy-manager
 ProtectSystem=full
-ReadWritePaths=/etc/haproxy/maps
-ProtectHome=yes
+# Il sandbox vale anche per l'helper lanciato con sudo: /etc/haproxy e la
+# repo servono ad add-backend (haproxy.cfg è root 0644, l'utente
+# haproxy-manager continua a poter scrivere solo le mappe)
+ReadWritePaths=/etc/haproxy /root/server-configs
+ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

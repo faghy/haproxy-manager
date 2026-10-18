@@ -8,10 +8,48 @@
 #   reload           haproxy -c e reload
 #   purge <dominio>  ban Varnish di dominio e www.dominio
 #   certs            "<file> <nome> <nome>…" per ogni certificato in /etc/haproxy/certs
+#   add-backend <nome> <ip>
+#                    nuovo backend <nome>_backend (server Plesk su <ip>:443, come
+#                    gli altri) in haproxy.cfg: haproxy -c sulla copia, reload,
+#                    ripristino se fallisce, sync slave, commit nella repo
 # =============================================
 set -euo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CFG=/etc/haproxy/haproxy.cfg
+REPO=/root/server-configs
+BACKUPS=/var/backups/haproxy
+
+# Blocco del backend prima di "# DEFAULT" (stesso testo nella copia della repo,
+# che differisce solo per la password delle statistiche)
+insert_backend() {
+    python3 - "$@" <<'EOF'
+import sys, re, datetime
+src, dst, name, ip = sys.argv[1:]
+s = open(src).read()
+block = (
+    "# -------------------------\n"
+    f"# {name.upper()} (aggiunto da haproxy-manager il {datetime.date.today():%d/%m/%Y})\n"
+    "# -------------------------\n"
+    f"backend {name}_backend\n"
+    "    option http-keep-alive\n"
+    "    timeout http-keep-alive 30s\n"
+    f"    server {name} {ip}:443 ssl verify none sni req.hdr(host) alpn http/1.1 check check-ssl inter 10s rise 2 fall 3 maxconn 500\n"
+    "\n"
+)
+m = re.search(r"^# -+\n# DEFAULT", s, re.M)
+if not m:
+    sys.exit("punto di inserimento (# DEFAULT) non trovato in " + src)
+open(dst, "w").write(s[:m.start()] + block + s[m.start():])
+EOF
+}
+
+valid_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o
+    for o in "${BASH_REMATCH[@]:1}"; do
+        [[ "$o" =~ ^(0|[1-9][0-9]*)$ ]] && (( o <= 255 )) || return 1
+    done
+}
 
 case "${1:-}" in
     check)
@@ -35,8 +73,51 @@ case "${1:-}" in
             echo "${f##*/} $names"
         done
         ;;
+    add-backend)
+        N="${2:-}" IP="${3:-}"
+        [[ "$N" =~ ^[a-z][a-z0-9-]{0,30}$ ]] ||
+            { echo "Nome non valido: lettere minuscole, cifre e -, es. server7" >&2; exit 2; }
+        valid_ipv4 "$IP" || { echo "Indirizzo IP non valido: $IP" >&2; exit 2; }
+        B="${N}_backend"
+        exec 8>/run/lock/haproxy-cfg.lock; flock 8
+        grep -qE "^backend ${B}\$" "$CFG" && { echo "Il backend $B esiste già" >&2; exit 3; }
+        grep -qE "^[[:space:]]*server ${N} " "$CFG" && { echo "Un server di nome $N esiste già" >&2; exit 3; }
+        grep -qE "^[[:space:]]*server [^ ]+ ${IP//./\\.}:" "$CFG" &&
+            { echo "$IP è già usato da un altro backend" >&2; exit 3; }
+
+        TMP=$(mktemp /etc/haproxy/.haproxy.cfg.XXXXXX)
+        trap 'rm -f "$TMP"' EXIT
+        insert_backend "$CFG" "$TMP" "$N" "$IP" >&2
+        haproxy -c -q -f "$TMP" >&2 || { echo "HAProxy rifiuta la configurazione, nessuna modifica" >&2; exit 1; }
+        mkdir -p "$BACKUPS"
+        BAK="$BACKUPS/haproxy.cfg.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$CFG" "$BAK"
+        chmod 0644 "$TMP"; mv "$TMP" "$CFG"
+        if ! systemctl reload haproxy; then
+            cp -a "$BAK" "$CFG"; systemctl reload haproxy || true
+            echo "Reload di HAProxy fallito: configurazione precedente ripristinata" >&2; exit 1
+        fi
+        exec 8>&-
+
+        # Slave subito, senza aspettare il cron (in background: lo slave può essere lento)
+        setsid -f bash -c '/usr/local/bin/sync-haproxy-slave.sh >> /var/log/haproxy-sync.log 2>&1' </dev/null >/dev/null 2>&1
+
+        # Repo: stesso blocco nella copia versionata
+        if cd "$REPO" 2>/dev/null && git pull --ff-only -q >/dev/null 2>&1 &&
+           insert_backend haproxy/haproxy.cfg haproxy/haproxy.cfg >/dev/null 2>&1; then
+            git add haproxy/haproxy.cfg
+            git commit -q -m "Backend $B ($IP) aggiunto da haproxy-manager" >/dev/null 2>&1 &&
+                git push -q >/dev/null 2>&1 || echo "attenzione: commit o push nella repo non riuscito"
+        else
+            echo "attenzione: repo non aggiornata"
+        fi
+
+        # Avviso, non errore: il server può non essere ancora pronto
+        timeout 4 bash -c "</dev/tcp/$IP/443" 2>/dev/null ||
+            echo "attenzione: $IP:443 non risponde ora (WireGuard/Plesk), HAProxy lo segnerà giù"
+        ;;
     *)
-        echo "uso: $0 check|reload|purge <dominio>|certs" >&2
+        echo "uso: $0 check|reload|purge <dominio>|certs|add-backend <nome> <ip>" >&2
         exit 2
         ;;
 esac
