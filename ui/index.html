@@ -123,6 +123,10 @@
           <input class="grow" type="text" id="new-domain" placeholder="esempio.it">
           <select id="new-backend" onchange="toggleNewOrigin()"></select>
           <select id="new-origin" title="Server di origine dietro Varnish" style="display:none"></select>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text2);cursor:pointer"
+                 title="Certificato Cloudflare Origin CA (zona e *.zona) e SSL Full (strict), solo se nessun certificato copre già il dominio">
+            <input type="checkbox" id="new-cert" checked> 🔒 crea certificato se manca
+          </label>
           <button class="btn btn-primary" onclick="addDomain()">Aggiungi</button>
         </div>
       </div>
@@ -190,6 +194,30 @@
               <tr><th>Backend</th><th>Indirizzo</th><th>Domini</th><th>Azioni</th></tr>
             </thead>
             <tbody id="backends-table"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <h2>🔒 Certificati (Cloudflare Origin CA)</h2>
+        <button class="btn btn-ghost btn-sm" onclick="loadCerts()">↻ Aggiorna</button>
+      </div>
+      <div class="panel-body">
+        <div class="form-row">
+          <input class="grow" type="text" id="new-cert-domain" placeholder="dominio, es. esempio.it (copre esempio.it e *.esempio.it)"
+                 onkeydown="if(event.key==='Enter')createCert(this.value)">
+          <button class="btn btn-primary" onclick="createCert(document.getElementById('new-cert-domain').value)">Crea certificato</button>
+        </div>
+        <div style="font-size:12px;color:#888;margin-top:-8px;margin-bottom:12px">
+          Valido 15 anni, solo per Cloudflare. Imposta anche SSL/TLS Full (strict) sulla zona.
+          Si toglie solo se nessun dominio ne ha più bisogno; togliendolo viene anche revocato su Cloudflare.
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>File</th><th>Nomi</th><th>Scadenza</th><th>Domini coperti</th><th>Azioni</th></tr></thead>
+            <tbody id="certs-table"></tbody>
           </table>
         </div>
       </div>
@@ -282,6 +310,7 @@ async function init() {
   await loadDomains();
   await loadHistory();
   await loadLogs();
+  await loadCerts();
   await checkStatus();
   // una sola volta, anche dopo logout e nuovo login; da sloggati non chiamano le API
   if (!timersStarted) {
@@ -432,7 +461,8 @@ function renderTable() {
       <td><input type="checkbox" class="row-check" value="${d.name}"
         ${selected.has(d.name) ? 'checked' : ''}
         onchange="toggleSelect('${d.name}', this.checked)"></td>
-      <td class="domain-name">${d.name}${d.cert === false ? '<span class="cert-missing" title="Nessun certificato in /etc/haproxy/certs copre questo dominio: Cloudflare risponderà 526">⚠ certificato</span>' : ''}</td>
+      <td class="domain-name">${d.name}${d.cert === false ? `<span class="cert-missing" title="Nessun certificato in /etc/haproxy/certs copre questo dominio: Cloudflare risponderà 526">⚠ certificato</span>
+        <button class="btn btn-ghost btn-sm" style="margin-left:6px;padding:2px 8px" title="Crea il certificato Cloudflare Origin CA" onclick="createCert('${d.name}')">🔒 Crea</button>` : ''}</td>
       <td>${badge(d.backend)}</td>
       <td>${d.origin ? badge(d.origin) : '<span style="color:var(--red)">mancante</span>'}</td>
       <td>
@@ -495,8 +525,10 @@ async function addDomain() {
   const backend = document.getElementById('new-backend').value;
   const origin  = backend === VARNISH ? document.getElementById('new-origin').value : null;
   if (!name) return toast('Inserisci un dominio', 'error');
-  const res = await api('/api/domains', 'POST', {name, backend, origin});
-  toast(res.message, res.success ? 'success' : 'error');
+  const create_cert = document.getElementById('new-cert').checked;
+  if (create_cert) toast('Aggiunta in corso (certificato Cloudflare: qualche secondo)…', 'success');
+  const res = await api('/api/domains', 'POST', {name, backend, origin, create_cert});
+  toast(res.message, res.success && !/NON creato/.test(res.message) ? 'success' : 'error');
   if (res.success) { document.getElementById('new-domain').value = ''; refresh(); }
 }
 
@@ -607,7 +639,43 @@ async function loadLogs() {
 }
 
 // Dopo una modifica: tabella, storico e log
-function refresh() { loadDomains(); loadHistory(); loadLogs(); }
+// ── Certificati ──────────────────────────────────────────────────
+let certs = [];
+async function loadCerts() {
+  const res = await api('/api/certs');
+  if (!res.success) return;
+  certs = res.data;
+  document.getElementById('certs-table').innerHTML = certs.map(c => {
+    const del = c.needed_by.length === 0
+      ? `<button class="btn btn-danger btn-sm" title="Togli e revoca su Cloudflare" onclick="deleteCert('${esc(c.file)}')">✕</button>`
+      : `<span style="font-size:12px;color:var(--text2)" title="${esc(c.needed_by.join(', '))}">in uso</span>`;
+    return `<tr>
+      <td><code>${esc(c.file)}</code></td>
+      <td style="font-size:12px">${c.names.map(esc).join('<br>')}</td>
+      <td>${esc(c.expires || '-')}</td>
+      <td title="${esc(c.domains.join(', '))}">${c.domains.length}</td>
+      <td>${del}</td></tr>`;
+  }).join('');
+}
+
+async function createCert(domain) {
+  domain = (domain || '').trim();
+  if (!domain) return toast('Inserisci un dominio', 'error');
+  if (!confirm(`Creare il certificato Cloudflare Origin CA per ${domain}?`)) return;
+  toast('Richiesta a Cloudflare in corso…', 'success');
+  const res = await api('/api/certs', 'POST', {domain});
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) { document.getElementById('new-cert-domain').value = ''; refresh(); }
+}
+
+async function deleteCert(file) {
+  if (!confirm(`Togliere ${file} da HAProxy (master e slave) e revocarlo su Cloudflare?`)) return;
+  const res = await api(`/api/certs/${encodeURIComponent(file)}`, 'DELETE');
+  toast(res.message, res.success ? 'success' : 'error');
+  if (res.success) refresh();
+}
+
+function refresh() { loadDomains(); loadHistory(); loadLogs(); loadCerts(); }
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

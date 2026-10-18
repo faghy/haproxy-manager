@@ -109,6 +109,26 @@ struct DomainRequest {
     backend: String,
     #[serde(default)]
     origin:  Option<String>,
+    // Aggiunta: crea il certificato Cloudflare Origin CA se nessuno copre il dominio
+    #[serde(default)]
+    create_cert: bool,
+}
+
+// Certificato in /etc/haproxy/certs come lo vede la UI
+#[derive(Serialize)]
+struct CertView {
+    file:    String,
+    expires: String,
+    names:   Vec<String>,
+    // Domini delle mappe coperti da questo certificato
+    domains: Vec<String>,
+    // Di questi, quelli che nessun altro certificato copre: se vuoto si può togliere
+    needed_by: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CertRequest {
+    domain: String,
 }
 
 #[derive(Deserialize)]
@@ -466,6 +486,17 @@ fn cert_covers(names: &[String], domain: &str) -> bool {
     names.iter().any(|n| n == domain || n.strip_prefix("*.") == Some(parent))
 }
 
+// Certificato Cloudflare Origin CA per il dominio (helper → cf-certs.py)
+async fn create_cert(state: &AppState, domain: &str) -> Result<String, String> {
+    let config = state.config.clone();
+    let d = domain.to_string();
+    let res = tokio::task::spawn_blocking(move || run_helper(&config, &["cert-create", &d]))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    *state.cert_cache.lock().unwrap() = None;
+    res.map(|out| out.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("; "))
+}
+
 fn cert_warning(state: &AppState, domain: &str) -> String {
     match cert_names(state) {
         Some(names) if !cert_covers(&names, domain) => format!(
@@ -751,11 +782,22 @@ async fn add_domain(
         backend: req.backend.clone(),
         origin:  Some(origin.clone()),
     });
-    match commit_change(&state.config, &old, &new, &format!("Aggiunto {}", name), None) {
+    let res = commit_change(&state.config, &old, &new, &format!("Aggiunto {}", name), None);
+    // Le chiamate a Cloudflare possono durare secondi: mappe già libere per gli eventi Plesk
+    drop(_lock);
+    match res {
         Ok(_) => {
             log_action(&state.config, "ADD", &name, &format!("{} (origine {})", req.backend, origin));
-            let warn = cert_warning(&state, &name);
-            reply(StatusCode::OK, true, format!("Dominio {} aggiunto{}", name, warn))
+            let covered = cert_names(&state).map(|n| cert_covers(&n, &name));
+            let extra = if req.create_cert && covered == Some(false) {
+                match create_cert(&state, &name).await {
+                    Ok(m) => format!(" — certificato: {}", m),
+                    Err(e) => format!(" — certificato NON creato: {}", e),
+                }
+            } else {
+                cert_warning(&state, &name)
+            };
+            reply(StatusCode::OK, true, format!("Dominio {} aggiunto{}", name, extra))
         }
         Err(e) => reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
     }
@@ -1114,6 +1156,92 @@ async fn delete_backend(
     }
 }
 
+// ── Handler Certificati ───────────────────────────────────────────
+async fn get_certs(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let config = state.config.clone();
+    let out = match tokio::task::spawn_blocking(move || run_helper(&config, &["certs-detail"]))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+    {
+        Ok(o) => o,
+        Err(e) => return reply(StatusCode::INTERNAL_SERVER_ERROR, false, e),
+    };
+    let parsed: Vec<(String, String, Vec<String>)> = out
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(3, '|');
+            let file = p.next()?.to_string();
+            let expires = p.next()?.to_string();
+            let names = p.next().unwrap_or("").split_whitespace().map(|s| s.to_lowercase()).collect();
+            Some((file, expires, names))
+        })
+        .collect();
+    let domains: Vec<String> = read_domains(&state.config).into_iter().map(|d| d.name).collect();
+    let certs: Vec<CertView> = parsed
+        .iter()
+        .map(|(file, expires, names)| {
+            let covered: Vec<String> = domains.iter().filter(|d| cert_covers(names, d)).cloned().collect();
+            let needed_by = covered
+                .iter()
+                .filter(|d| !parsed.iter().any(|(f, _, n)| f != file && cert_covers(n, d)))
+                .cloned()
+                .collect();
+            CertView { file: file.clone(), expires: expires.clone(), names: names.clone(), domains: covered, needed_by }
+        })
+        .collect();
+    Json(ApiResponse {
+        success: true,
+        message: format!("{} certificati", certs.len()),
+        data: Some(certs),
+    })
+    .into_response()
+}
+
+async fn add_cert(
+    State(state): State<AppState>,
+    Json(req): Json<CertRequest>,
+) -> impl IntoResponse {
+    let domain = match normalize_domain(&req.domain) {
+        Ok(d) => d,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, false, e),
+    };
+    match create_cert(&state, &domain).await {
+        Ok(msg) => {
+            log_action(&state.config, "CERT", &domain, &msg);
+            reply(StatusCode::OK, true, format!("{}: {}", domain, msg))
+        }
+        Err(e) => reply(StatusCode::BAD_REQUEST, false, e),
+    }
+}
+
+async fn delete_cert(
+    State(state): State<AppState>,
+    Path(file): Path<String>,
+) -> impl IntoResponse {
+    let valid = file.ends_with(".pem")
+        && !file.starts_with('.')
+        && file.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-');
+    if !valid {
+        return reply(StatusCode::BAD_REQUEST, false, format!("Nome di file non valido: {}", file));
+    }
+    let config = state.config.clone();
+    let f = file.clone();
+    let res = tokio::task::spawn_blocking(move || run_helper(&config, &["cert-remove", &f]))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    *state.cert_cache.lock().unwrap() = None;
+    match res {
+        Ok(out) => {
+            let msg = out.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("; ");
+            log_action(&state.config, "CERT-DEL", &file, &msg);
+            reply(StatusCode::OK, true, format!("{}: {}", file, msg))
+        }
+        Err(e) => reply(StatusCode::BAD_REQUEST, false, e),
+    }
+}
+
 // ── Handler Sistema ───────────────────────────────────────────────
 async fn haproxy_reload(
     State(state): State<AppState>,
@@ -1291,6 +1419,10 @@ async fn main() {
         .route("/api/backends/details",    get(get_backend_details))
         .route("/api/backends/{backend}",  put(update_backend))
         .route("/api/backends/{backend}",  delete(delete_backend))
+        // Certificati Cloudflare Origin CA
+        .route("/api/certs",               get(get_certs))
+        .route("/api/certs",               post(add_cert))
+        .route("/api/certs/{file}",        delete(delete_cert))
         // Sistema
         .route("/api/haproxy/reload",      post(haproxy_reload))
         .route("/api/haproxy/status",      get(haproxy_status))

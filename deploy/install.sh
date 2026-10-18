@@ -13,6 +13,9 @@ id "$U" >/dev/null 2>&1 ||
     useradd --system --home-dir /var/lib/haproxy-manager --no-create-home --shell /usr/sbin/nologin "$U"
 
 install -m 0755 deploy/haproxy-manager-helper /usr/local/sbin/haproxy-manager-helper
+install -D -m 0755 deploy/cf-certs.py /usr/local/lib/haproxy-manager/cf-certs.py
+[ -f /root/.cloudflare.env ] ||
+    echo "attenzione: /root/.cloudflare.env mancante, i certificati Cloudflare non si possono creare"
 install -m 0644 deploy/tmpfiles.conf /etc/tmpfiles.d/haproxy-manager.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/haproxy-manager.conf
 chown root:"$U" /run/lock/haproxy-maps.lock; chmod 0664 /run/lock/haproxy-maps.lock

@@ -15,6 +15,14 @@
 #                    sposta il server di <nome>_backend su <ip> (porta invariata)
 #   remove-backend <nome>
 #                    toglie <nome>_backend se nessun dominio e nessuna regola lo usa
+#   certs-detail     "<file>|<scadenza>|<nomi>" per ogni certificato
+#   cert-create <dominio>
+#                    certificato Cloudflare Origin CA (zona e *.zona) se manca,
+#                    haproxy -c, reload, sync slave; SSL Full (strict) sulla zona
+#   cert-remove <file.pem>
+#                    toglie il certificato se nessun dominio delle mappe ne ha
+#                    bisogno (copia in /var/backups/haproxy/certs), reload, sync,
+#                    poi lo revoca su Cloudflare
 #
 # Per add/set-ip/remove: haproxy -c sulla copia, backup in /var/backups/haproxy,
 # reload (ripristino se fallisce), sync slave, stessa modifica nella repo.
@@ -26,6 +34,9 @@ CFG=/etc/haproxy/haproxy.cfg
 MAPS="/etc/haproxy/maps/domains.map /etc/haproxy/maps/backends.map"
 REPO=/root/server-configs
 BACKUPS=/var/backups/haproxy
+CERT_DIR=/etc/haproxy/certs
+# Chiamate a Cloudflare e lettura dei certificati (segreti in /root/.cloudflare.env)
+CFCERTS=/usr/local/lib/haproxy-manager/cf-certs.py
 # Backend di servizio: non si tolgono dall'interfaccia
 PROTECTED="varnish_backend default_backend grafana_backend"
 
@@ -108,8 +119,7 @@ apply_cfg() {
     fi
     exec 8>&-
 
-    # Slave subito, senza aspettare il cron (in background: lo slave può essere lento)
-    setsid -f bash -c '/usr/local/bin/sync-haproxy-slave.sh >> /var/log/haproxy-sync.log 2>&1' </dev/null >/dev/null 2>&1
+    sync_slave
 
     # Repo: stessa modifica nella copia versionata
     if cd "$REPO" 2>/dev/null && git pull --ff-only -q >/dev/null 2>&1 &&
@@ -126,6 +136,11 @@ apply_cfg() {
 backend_ip() {
     awk -v b="backend $1" '$0 == b { f = 1; next } f && /^[^ \t]/ { f = 0 }
         f && $1 == "server" { split($3, a, ":"); print a[1]; exit }' "$CFG"
+}
+
+# Slave subito, senza aspettare il cron (in background: lo slave può essere lento)
+sync_slave() {
+    setsid -f bash -c '/usr/local/bin/sync-haproxy-slave.sh >> /var/log/haproxy-sync.log 2>&1' </dev/null >/dev/null 2>&1
 }
 
 valid_name() {
@@ -214,8 +229,62 @@ case "${1:-}" in
             { echo "Il backend $B è citato in altre regole di haproxy.cfg" >&2; exit 3; }
         apply_cfg "Backend $B rimosso da haproxy-manager" remove "$N"
         ;;
+    certs-detail)
+        python3 "$CFCERTS" list
+        ;;
+    cert-create)
+        D="${2:-}"
+        exec 8>/run/lock/haproxy-cfg.lock; flock 8
+        OUT=$(python3 "$CFCERTS" create "$D")
+        case "$OUT" in
+            "EXISTS "*)
+                echo "certificato già presente: ${OUT#EXISTS }"
+                ;;
+            "NEW "*)
+                PEM="${OUT#NEW }"
+                NEWF="$CERT_DIR/.$PEM.new"
+                chown haproxy:haproxy "$NEWF"; chmod 0600 "$NEWF"
+                mv "$NEWF" "$CERT_DIR/$PEM"
+                if ! haproxy -c -q -f "$CFG" >&2; then
+                    rm -f "$CERT_DIR/$PEM"
+                    echo "HAProxy rifiuta il certificato $PEM: tolto" >&2; exit 1
+                fi
+                systemctl reload haproxy
+                sync_slave
+                echo "creato $PEM"
+                ;;
+            *)
+                echo "risposta inattesa: $OUT" >&2; exit 1
+                ;;
+        esac
+        exec 8>&-
+        python3 "$CFCERTS" strict "$D" || echo "attenzione: SSL Full (strict) non impostato sulla zona"
+        ;;
+    cert-remove)
+        F="${2:-}"
+        [[ "$F" =~ ^[a-z0-9][a-z0-9.-]{0,250}\.pem$ ]] || { echo "Nome di file non valido: $F" >&2; exit 2; }
+        exec 8>/run/lock/haproxy-cfg.lock; flock 8
+        [ -f "$CERT_DIR/$F" ] || { echo "Il certificato $F non esiste" >&2; exit 3; }
+        USED=$(python3 "$CFCERTS" used "$F")
+        [ -z "$USED" ] || { echo "Il certificato $F serve ancora a: $(echo $USED | cut -c1-200)" >&2; exit 3; }
+        [ "$(find "$CERT_DIR" -maxdepth 1 -name '*.pem' ! -name '.*' | wc -l)" -gt 1 ] ||
+            { echo "È l'ultimo certificato: HAProxy non partirebbe senza" >&2; exit 3; }
+        install -d -m 0700 "$BACKUPS/certs"
+        BAK="$BACKUPS/certs/$F"
+        [ -e "$BAK" ] && mv "$BAK" "$BAK.$(date +%Y%m%d-%H%M%S)"
+        mv "$CERT_DIR/$F" "$BAK"
+        if ! haproxy -c -q -f "$CFG" >&2; then
+            mv "$BAK" "$CERT_DIR/$F"
+            echo "HAProxy rifiuta la configurazione senza $F: rimesso" >&2; exit 1
+        fi
+        systemctl reload haproxy
+        sync_slave
+        exec 8>&-
+        echo "tolto da HAProxy (copia in $BAK)"
+        python3 "$CFCERTS" revoke "$BAK" || echo "attenzione: revoca su Cloudflare non riuscita"
+        ;;
     *)
-        echo "uso: $0 check|reload|purge <dominio>|certs|add-backend <nome> <ip>|set-backend-ip <nome> <ip>|remove-backend <nome>" >&2
+        echo "uso: $0 check|reload|purge <dominio>|certs|certs-detail|add-backend <nome> <ip>|set-backend-ip <nome> <ip>|remove-backend <nome>|cert-create <dominio>|cert-remove <file.pem>" >&2
         exit 2
         ;;
 esac
