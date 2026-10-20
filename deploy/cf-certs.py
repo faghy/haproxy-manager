@@ -13,6 +13,10 @@
 #   revoke <percorso>   revoca su Cloudflare il certificato uguale a quello del file
 #                       (in /etc/haproxy/certs o nella copia in /var/backups/haproxy/certs)
 #   list                "<file>|<scadenza>|<nome> <nome>…" per ogni certificato
+#   aop <dominio>       Authenticated Origin Pulls sulla zona: carica il nostro
+#                       certificato client (/root/aop/client.pem, firmato dalla CA
+#                       in /etc/haproxy/aop/ca.pem) se manca, aspetta che sia
+#                       attivo, accende l'impostazione; stampa "AOP <zona>"
 #
 # Segreti: /root/.cloudflare.env (CF_API_TOKEN, CF_ORIGIN_CA_KEY, come sui
 # Plesk; scripts/rotate-cloudflare-env.sh nella repo di configurazione).
@@ -34,6 +38,7 @@ ENV_FILE = "/root/.cloudflare.env"
 API = "https://api.cloudflare.com/client/v4"
 DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$")
 BACKUP_DIR = "/var/backups/haproxy/certs"
+AOP_CERT, AOP_KEY = "/root/aop/client.pem", "/root/aop/client.key"
 FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,250}\.pem$")
 
 
@@ -208,6 +213,33 @@ def cmd_revoke(path):
     print("attenzione: certificato non trovato tra quelli Origin CA della zona, non revocato")
 
 
+def cmd_aop(domain):
+    import time
+    env = secrets()
+    zone, zid = find_zone(normalize(domain), env["CF_API_TOKEN"])
+    tok = env["CF_API_TOKEN"]
+    try:
+        cert, key = open(AOP_CERT).read(), open(AOP_KEY).read()
+    except OSError as e:
+        die(f"certificato client mancante: {e}")
+    mine = cert_body(cert)
+    have = call("GET", f"/zones/{zid}/origin_tls_client_auth", token=tok).get("result") or []
+    if not any(cert_body(c.get("certificate", "")) == mine for c in have):
+        call("POST", f"/zones/{zid}/origin_tls_client_auth", token=tok,
+             body={"certificate": cert, "private_key": key})
+    for _ in range(30):
+        have = call("GET", f"/zones/{zid}/origin_tls_client_auth", token=tok).get("result") or []
+        st = [c.get("status") for c in have if cert_body(c.get("certificate", "")) == mine]
+        if st and st[0] == "active":
+            break
+        time.sleep(5)
+    else:
+        die(f"{zone}: certificato client non attivo dopo 150 s")
+    if not call("GET", f"/zones/{zid}/origin_tls_client_auth/settings", token=tok)["result"].get("enabled"):
+        call("PUT", f"/zones/{zid}/origin_tls_client_auth/settings", token=tok, body={"enabled": True})
+    print(f"AOP {zone}")
+
+
 def cmd_list():
     for f in pem_files():
         path = os.path.join(CERT_DIR, f)
@@ -219,10 +251,10 @@ def cmd_list():
 
 
 if __name__ == "__main__":
-    cmds = {"create": cmd_create, "strict": cmd_strict, "used": cmd_used, "revoke": cmd_revoke}
+    cmds = {"create": cmd_create, "strict": cmd_strict, "used": cmd_used, "revoke": cmd_revoke, "aop": cmd_aop}
     if len(sys.argv) == 2 and sys.argv[1] == "list":
         cmd_list()
     elif len(sys.argv) == 3 and sys.argv[1] in cmds:
         cmds[sys.argv[1]](sys.argv[2])
     else:
-        die("uso: cf-certs.py create|strict <dominio> | used <file.pem> | revoke <percorso> | list")
+        die("uso: cf-certs.py create|strict|aop <dominio> | used <file.pem> | revoke <percorso> | list")

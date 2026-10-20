@@ -19,6 +19,12 @@
 #   cert-create <dominio>
 #                    certificato Cloudflare Origin CA (zona e *.zona) se manca,
 #                    haproxy -c, reload, sync slave; SSL Full (strict) sulla zona
+#   aop-enable <dominio>
+#                    Authenticated Origin Pulls: certificato client nostro sulla
+#                    zona (cf-certs.py aop), poi la zona in /etc/haproxy/aop/zones.lst
+#                    (HAProxy accetta solo connessioni con quel certificato);
+#                    se il sito poi non risponde, toglie la zona dall'elenco.
+#                    Lo avvia cert-create in background
 #   cert-remove <file.pem>
 #                    toglie il certificato se nessun dominio delle mappe ne ha
 #                    bisogno (copia in /var/backups/haproxy/certs), reload, sync,
@@ -259,6 +265,34 @@ case "${1:-}" in
         esac
         exec 8>&-
         python3 "$CFCERTS" strict "$D" || echo "attenzione: SSL Full (strict) non impostato sulla zona"
+        # Authenticated Origin Pulls in background (fino a ~1 minuto), esito in syslog
+        setsid -f bash -c "$0 aop-enable '$D' 2>&1 | logger -t haproxy-aop" </dev/null >/dev/null 2>&1
+        ;;
+    aop-enable)
+        D="${2:-}"
+        [[ "$D" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$ ]] ||
+            { echo "dominio non valido" >&2; exit 2; }
+        LIST=/etc/haproxy/aop/zones.lst
+        OUT=$(python3 "$CFCERTS" aop "$D")
+        ZONE="${OUT#AOP }"
+        [ -n "$ZONE" ] && [ "$ZONE" != "$OUT" ] || { echo "risposta inattesa: $OUT" >&2; exit 1; }
+        if grep -qx "$ZONE" "$LIST"; then echo "$ZONE: già nell'elenco"; exit 0; fi
+        # Cloudflare impiega qualche secondo a presentare il certificato
+        sleep 30
+        exec 8>/run/lock/haproxy-cfg.lock; flock 8
+        echo "$ZONE" >> "$LIST"
+        haproxy -c -q -f "$CFG" >&2 && systemctl reload haproxy
+        exec 8>&-
+        sleep 5
+        C=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "https://$D/?aop-check=$(date +%s)")
+        if [[ "$C" =~ ^(2|3)[0-9][0-9]$ ]]; then
+            sync_slave
+            echo "$ZONE: Authenticated Origin Pulls attivo (verifica $D: $C)"
+        else
+            exec 8>/run/lock/haproxy-cfg.lock; flock 8
+            sed -i "/^${ZONE//./\\.}\$/d" "$LIST"; systemctl reload haproxy
+            echo "$ZONE: verifica $D fallita ($C), tolta dall'elenco" >&2; exit 1
+        fi
         ;;
     cert-remove)
         F="${2:-}"
@@ -284,7 +318,7 @@ case "${1:-}" in
         python3 "$CFCERTS" revoke "$BAK" || echo "attenzione: revoca su Cloudflare non riuscita"
         ;;
     *)
-        echo "uso: $0 check|reload|purge <dominio>|certs|certs-detail|add-backend <nome> <ip>|set-backend-ip <nome> <ip>|remove-backend <nome>|cert-create <dominio>|cert-remove <file.pem>" >&2
+        echo "uso: $0 check|reload|purge <dominio>|certs|certs-detail|add-backend <nome> <ip>|set-backend-ip <nome> <ip>|remove-backend <nome>|cert-create <dominio>|aop-enable <dominio>|cert-remove <file.pem>" >&2
         exit 2
         ;;
 esac
