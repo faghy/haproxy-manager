@@ -1,0 +1,47 @@
+#!/bin/bash
+# =============================================
+# haproxy-manager-open (installato da client/install-launcher.sh in ~/.local/bin)
+# Apre haproxy-manager: tunnel SSH verso il master (alias "hamgr" in
+# ~/.ssh/config, porta locale 8888) e poi il browser.
+# Il tunnel resta in background; "haproxy-manager-open stop" lo chiude.
+# Funziona su Linux (qualsiasi desktop) e macOS.
+# =============================================
+PORT="${HAMGR_PORT:-8888}"
+URL="http://localhost:$PORT"
+PATTERN="^ssh .*-N hamgr$"
+
+notify() {  # notify <urgenza> <testo>
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -u "$1" "HAProxy Manager" "$2"
+    elif command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"$2\" with title \"HAProxy Manager\"" >/dev/null 2>&1
+    else
+        echo "HAProxy Manager: $2" >&2
+    fi
+}
+
+listening() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
+
+open_url() {
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$URL" >/dev/null 2>&1 &
+    elif command -v open >/dev/null 2>&1; then
+        open "$URL"
+    else
+        echo "$URL"
+    fi
+}
+
+if [ "${1:-}" = stop ]; then
+    if pkill -f "$PATTERN"; then notify normal "Tunnel chiuso"; fi
+    exit 0
+fi
+
+if ! listening; then
+    if ! ssh -f -o BatchMode=yes -o ConnectTimeout=8 -N hamgr; then
+        notify critical "Tunnel non riuscito: WireGuard attivo? Porta $PORT libera? Chiave SSH autorizzata sul master?"
+        exit 1
+    fi
+    for _ in $(seq 20); do listening && break; sleep 0.25; done
+fi
+open_url
